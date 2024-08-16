@@ -21,6 +21,10 @@ if os.environ.get("DEBUG_TOOLKIT", "0") == "1":
 import argparse
 from toolkit.job import get_job
 
+import torch
+if torch.cuda.get_device_properties(0).major >= 8 and not os.environ.get("USE_TF32", "1") == "0":
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
 def print_end_message(jobs_completed, jobs_failed):
     failure_string = f"{jobs_failed} failure{'' if jobs_failed == 1 else 's'}" if jobs_failed > 0 else ""
