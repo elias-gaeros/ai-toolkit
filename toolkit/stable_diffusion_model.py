@@ -1746,20 +1746,35 @@ class StableDiffusion:
 
                     cast_dtype = self.unet.dtype
                     # with torch.amp.autocast(device_type='cuda', dtype=cast_dtype):
-                    noise_pred = self.unet(
-                        hidden_states=latent_model_input_packed.to(self.device_torch, cast_dtype),  # [1, 4096, 64]
-                        # YiYi notes: divide it by 1000 for now because we scale it by 1000 in the transforme rmodel (we should not keep it but I want to keep the inputs same for the model for testing)
-                        # todo make sure this doesnt change
-                        timestep=timestep / 1000,  # timestep is 1000 scale
-                        encoder_hidden_states=text_embeddings.text_embeds.to(self.device_torch, cast_dtype),
-                        # [1, 512, 4096]
-                        pooled_projections=text_embeddings.pooled_embeds.to(self.device_torch, cast_dtype),  # [1, 768]
-                        txt_ids=txt_ids,  # [1, 512, 3]
-                        img_ids=img_ids,  # [1, 4096, 3]
-                        guidance=guidance,
-                        return_dict=False,
-                        **kwargs,
-                    )[0]
+                    if isinstance(self.unet, flux.Flux):
+                        noise_pred = self.unet.forward_orig(
+                            img=latent_model_input_packed.to(self.device_torch, cast_dtype),  # [1, 4096, 64]                        
+                            img_ids=img_ids,  # [1, 4096, 3]
+                            txt=text_embeddings.text_embeds.to(self.device_torch, cast_dtype),
+                            txt_ids=txt_ids,  # [1, 512, 3]
+                            # YiYi notes: divide it by 1000 for now because we scale it by 1000 in the transforme rmodel (we should not keep it but I want to keep the inputs same for the model for testing)
+                            # todo make sure this doesnt change
+                            timesteps=timestep / 1000,  # timestep is 1000 scale
+                            # [1, 512, 4096]
+                            y=text_embeddings.pooled_embeds.to(self.device_torch, cast_dtype),  # [1, 768]
+                            guidance=guidance,
+                            **kwargs,
+                        )
+                    else:
+                        noise_pred = self.unet(
+                            hidden_states=latent_model_input_packed.to(self.device_torch, cast_dtype),  # [1, 4096, 64]
+                            # YiYi notes: divide it by 1000 for now because we scale it by 1000 in the transforme rmodel (we should not keep it but I want to keep the inputs same for the model for testing)
+                            # todo make sure this doesnt change
+                            timestep=timestep / 1000,  # timestep is 1000 scale
+                            encoder_hidden_states=text_embeddings.text_embeds.to(self.device_torch, cast_dtype),
+                            # [1, 512, 4096]
+                            pooled_projections=text_embeddings.pooled_embeds.to(self.device_torch, cast_dtype),  # [1, 768]
+                            txt_ids=txt_ids,  # [1, 512, 3]
+                            img_ids=img_ids,  # [1, 4096, 3]
+                            guidance=guidance,
+                            return_dict=False,
+                            **kwargs,
+                        )[0]
 
                     if isinstance(noise_pred, QTensor):
                         noise_pred = noise_pred.dequantize()
