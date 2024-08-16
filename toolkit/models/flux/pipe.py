@@ -687,7 +687,7 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
                 else:
                     guidance = None
 
-                noise_pred = self.transformer.forward_orig(
+                noise_pred = self.transformer.forward(
                     img=latents,
                     img_ids=latent_image_ids,
                     txt=prompt_embeds,

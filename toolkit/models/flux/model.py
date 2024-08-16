@@ -1,30 +1,14 @@
-#Original code can be found on: https://github.com/black-forest-labs/flux
-
 from dataclasses import dataclass
 
 import torch
 from torch import Tensor, nn
-from einops import rearrange, repeat
-
-from .layers import (
-    DoubleStreamBlock,
-    EmbedND,
-    LastLayer,
-    MLPEmbedder,
-    SingleStreamBlock,
-    timestep_embedding,
-)
-from .utils import ModelMixin
 from torch.utils.checkpoint import checkpoint
 
+from .layers import (DoubleStreamBlock, EmbedND, LastLayer,
+                                 MLPEmbedder, SingleStreamBlock,
+                                 timestep_embedding)
+from .utils import ModelMixin
 
-
-def pad_to_patch_size(img, patch_size=(2, 2), padding_mode="circular"):
-    if padding_mode == "circular" and torch.jit.is_tracing() or torch.jit.is_scripting():
-        padding_mode = "reflect"
-    pad_h = (patch_size[0] - img.shape[-2] % patch_size[0]) % patch_size[0]
-    pad_w = (patch_size[1] - img.shape[-1] % patch_size[1]) % patch_size[1]
-    return torch.nn.functional.pad(img, (0, pad_w, 0, pad_h), mode=padding_mode)
 
 @dataclass
 class FluxParams:
@@ -36,7 +20,7 @@ class FluxParams:
     num_heads: int
     depth: int
     depth_single_blocks: int
-    axes_dim: list
+    axes_dim: list[int]
     theta: int
     qkv_bias: bool
     guidance_embeds: bool
@@ -47,7 +31,7 @@ class Flux(nn.Module, ModelMixin):
     Transformer model for flow matching on sequences.
     """
 
-    def __init__(self, params, final_layer=True, dtype=None, device=None, operations=None):
+    def __init__(self, params: FluxParams):
         super().__init__()
         self.config = params
         self.in_channels = params.in_channels
@@ -62,13 +46,13 @@ class Flux(nn.Module, ModelMixin):
         self.hidden_size = params.hidden_size
         self.num_heads = params.num_heads
         self.pe_embedder = EmbedND(dim=pe_dim, theta=params.theta, axes_dim=params.axes_dim)
-        self.img_in = operations.Linear(self.in_channels, self.hidden_size, bias=True, dtype=dtype, device=device)
-        self.time_in = MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size, dtype=dtype, device=device, operations=operations)
-        self.vector_in = MLPEmbedder(params.vec_in_dim, self.hidden_size, dtype=dtype, device=device, operations=operations)
+        self.img_in = nn.Linear(self.in_channels, self.hidden_size, bias=True)
+        self.time_in = MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size)
+        self.vector_in = MLPEmbedder(params.vec_in_dim, self.hidden_size)
         self.guidance_in = (
-            MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size, dtype=dtype, device=device, operations=operations) if params.guidance_embeds else nn.Identity()
+            MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size) if params.guidance_embeds else nn.Identity()
         )
-        self.txt_in = operations.Linear(params.context_in_dim, self.hidden_size, dtype=dtype, device=device)
+        self.txt_in = nn.Linear(params.context_in_dim, self.hidden_size)
 
         self.double_blocks = nn.ModuleList(
             [
@@ -77,7 +61,6 @@ class Flux(nn.Module, ModelMixin):
                     self.num_heads,
                     mlp_ratio=params.mlp_ratio,
                     qkv_bias=params.qkv_bias,
-                    dtype=dtype, device=device, operations=operations
                 )
                 for _ in range(params.depth)
             ]
@@ -85,15 +68,14 @@ class Flux(nn.Module, ModelMixin):
 
         self.single_blocks = nn.ModuleList(
             [
-                SingleStreamBlock(self.hidden_size, self.num_heads, mlp_ratio=params.mlp_ratio, dtype=dtype, device=device, operations=operations)
+                SingleStreamBlock(self.hidden_size, self.num_heads, mlp_ratio=params.mlp_ratio)
                 for _ in range(params.depth_single_blocks)
             ]
         )
 
-        if final_layer:
-            self.final_layer = LastLayer(self.hidden_size, 1, self.out_channels, dtype=dtype, device=device, operations=operations)
+        self.final_layer = LastLayer(self.hidden_size, 1, self.out_channels)
 
-    def forward_orig(
+    def forward(
         self,
         img: Tensor,
         img_ids: Tensor,
@@ -101,73 +83,49 @@ class Flux(nn.Module, ModelMixin):
         txt_ids: Tensor,
         timesteps: Tensor,
         y: Tensor,
-        guidance: Tensor = None,
-        control=None,
+        guidance: Tensor | None = None,
     ) -> Tensor:
         if img.ndim != 3 or txt.ndim != 3:
             raise ValueError("Input img and txt tensors must have 3 dimensions.")
 
+        dtype = self.dtype
         # running on sequences img
-        # print(f'{img.dtype=} {txt.dtype=}')
         img = self.img_in(img)
-        
-        vec = self.time_in(timestep_embedding(timesteps, 256).to(img.dtype))
+        vec = timestep_embedding(timesteps, 256).to(dtype)
+        vec = self.time_in(vec)
         if self.config.guidance_embeds:
             if guidance is None:
                 raise ValueError("Didn't get guidance strength for guidance distilled model.")
-            vec = vec + self.guidance_in(timestep_embedding(guidance, 256).to(img.dtype))
-
+            vec = vec + self.guidance_in(timestep_embedding(guidance, 256).to(dtype))
         vec = vec + self.vector_in(y)
         txt = self.txt_in(txt)
 
-        # print(f'in -> {img.dtype=} {txt.dtype=} {vec.dtype=}')
-
         ids = torch.cat((txt_ids, img_ids), dim=1)
-        pe = self.pe_embedder(ids)
-        # print(f'{txt_ids.dtype=} {img_ids.dtype=} {ids.dtype=} {pe.dtype=}')
+        pe = self.pe_embedder(ids).to(dtype)
 
-        for i, block in enumerate(self.double_blocks):
+        for block in self.double_blocks:
+            assert img.dtype == torch.bfloat16
+            assert txt.dtype == torch.bfloat16
+            assert vec.dtype == torch.bfloat16
+            assert pe.dtype == torch.bfloat16
             if self.training:
                 img, txt = checkpoint(block, img, txt, vec, pe, use_reentrant=False)
             else:
+                assert False
                 img, txt = block(img=img, txt=txt, vec=vec, pe=pe)
-
-            if control is not None: #Controlnet
-                control_o = control.get("output")
-                if i < len(control_o):
-                    add = control_o[i]
-                    if add is not None:
-                        img += add
-
-        # print(f'double_block -> {img.dtype=} {txt.dtype=}')
 
         img = torch.cat((txt, img), 1)
         for block in self.single_blocks:
+            assert img.dtype == torch.bfloat16
+            assert txt.dtype == torch.bfloat16
+            assert vec.dtype == torch.bfloat16
+            assert pe.dtype == torch.bfloat16
             if self.training:
                 img = checkpoint(block, img, vec, pe, use_reentrant=False)
             else:
+                assert False
                 img = block(img, vec=vec, pe=pe)
         img = img[:, txt.shape[1] :, ...]
 
-        # print(f'double_block -> {img.dtype=}')
-
         img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)
         return img
-
-    def forward(self, x, timestep, context, y, guidance, control=None, **kwargs):
-        bs, c, h, w = x.shape
-        patch_size = 2
-        x = pad_to_patch_size(x, (patch_size, patch_size))
-
-        img = rearrange(x, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=patch_size, pw=patch_size)
-
-        h_len = ((h + (patch_size // 2)) // patch_size)
-        w_len = ((w + (patch_size // 2)) // patch_size)
-        img_ids = torch.zeros((h_len, w_len, 3), device=x.device, dtype=x.dtype)
-        img_ids[..., 1] = img_ids[..., 1] + torch.linspace(0, h_len - 1, steps=h_len, device=x.device, dtype=x.dtype)[:, None]
-        img_ids[..., 2] = img_ids[..., 2] + torch.linspace(0, w_len - 1, steps=w_len, device=x.device, dtype=x.dtype)[None, :]
-        img_ids = repeat(img_ids, "h w c -> b (h w) c", b=bs)
-
-        txt_ids = torch.zeros((bs, context.shape[1], 3), device=x.device, dtype=x.dtype)
-        out = self.forward_orig(img, img_ids, context, txt_ids, timestep, y, guidance, control)
-        return rearrange(out, "b (h w) (c ph pw) -> b c (h ph) (w pw)", h=h_len, w=w_len, ph=2, pw=2)[:,:,:h,:w]
