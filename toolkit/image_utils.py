@@ -27,6 +27,7 @@ ICO = types['ICO'] = 'ICO'
 JPEG = types['JPEG'] = 'JPEG'
 PNG = types['PNG'] = 'PNG'
 TIFF = types['TIFF'] = 'TIFF'
+JXL = types['JXL'] = 'JXL'
 
 image_fields = ['path', 'type', 'file_size', 'width', 'height']
 
@@ -94,6 +95,20 @@ def get_image_metadata(file_path):
     with io.open(file_path, "rb") as input:
         return get_image_metadata_from_bytesio(input, size, file_path)
 
+class Bitstream:
+    """
+    A stream of bits with methods for easy handling.
+    """
+
+    def __init__(self, bitstream: bytes) -> None:
+        self.bitstream: int = int.from_bytes(bitstream, "little")
+        self.shift: int = 0
+
+    def get_bits(self, length: int = 1) -> int:
+        bitmask = 2**length - 1
+        bits = (self.bitstream >> self.shift) & bitmask
+        self.shift += length
+        return bits
 
 def get_image_metadata_from_bytesio(input, size, file_path=None):
     """
@@ -110,10 +125,106 @@ def get_image_metadata_from_bytesio(input, size, file_path=None):
     """
     height = -1
     width = -1
-    data = input.read(26)
+    data = input.read(512)
     msg = " raised while trying to decode as JPEG."
 
-    if (size >= 10) and data[:6] in (b'GIF87a', b'GIF89a'):
+    is_jxlc_isobmff = data.startswith(b"\x00\x00\x00\x0cJXL \x0d\x0a\x87\x0a")
+    is_jxl_naked = data.startswith(b"\xff\x0a")
+    if is_jxlc_isobmff or is_jxl_naked:
+        imgtype = JXL
+        if is_jxlc_isobmff:
+            # Reject files missing required boxes. These two boxes are required to be at
+            # the start and contain no values, so we can manually check there presence.
+            # Signature box. (Redundant as has already been checked.)
+            # File Type box.
+            if data[12:32] != b"\x00\x00\x00\x14ftypjxl \x00\x00\x00\x00jxl ":
+                raise ValueError("Invalid file type box.")
+
+            container_pointer = 32
+            while container_pointer < len(data):
+                box_start = container_pointer
+                lbox = int.from_bytes(data[box_start : box_start + 4])
+                xlbox = None
+                if 1 < lbox <= 8:
+                    raise ValueError(f"Invalid LBox at byte {box_start}.")
+                if lbox == 1:
+                    xlbox = int.from_bytes(data[box_start + 8 : box_start + 16])
+                    if xlbox <= 16:
+                        raise ValueError(f"Invalid XLBox at byte {box_start}.")
+                if xlbox:
+                    header_length = 16
+                    box_length = xlbox
+                else:
+                    header_length = 8
+                    if lbox == 0:
+                        box_length = len(data) - box_start
+                    else:
+                        box_length = lbox
+                box_type = data[box_start + 4 : box_start + 8]
+                if box_type == b"jxlc" or box_type == b"jxlp":
+                    data = data[box_start + header_length : box_start + box_length]
+                    if box_type == b"jxlp":
+                        # Should be the first fragment
+                        if int.from_bytes(data[0:4]) != 0:
+                            raise ValueError("Missing codestream box")
+                        data = data[4:]  # skip the fragment index
+                    break
+                container_pointer += box_length
+            else:
+                raise ValueError("Missing codestream box")
+
+        # Convert codestream to int within an object to get some handy methods.
+        codestream = Bitstream(data)
+
+        # Skip signature
+        codestream.shift += 16
+
+        # SizeHeader
+        div8 = codestream.get_bits(1)
+        if div8:
+            height = 8 * (1 + codestream.get_bits(5))
+        else:
+            distribution = codestream.get_bits(2)
+            match distribution:
+                case 0:
+                    height = 1 + codestream.get_bits(9)
+                case 1:
+                    height = 1 + codestream.get_bits(13)
+                case 2:
+                    height = 1 + codestream.get_bits(18)
+                case 3:
+                    height = 1 + codestream.get_bits(30)
+        ratio = codestream.get_bits(3)
+        if div8 and not ratio:
+            width = 8 * (1 + codestream.get_bits(5))
+        elif not ratio:
+            distribution = codestream.get_bits(2)
+            match distribution:
+                case 0:
+                    width = 1 + codestream.get_bits(9)
+                case 1:
+                    width = 1 + codestream.get_bits(13)
+                case 2:
+                    width = 1 + codestream.get_bits(18)
+                case 3:
+                    width = 1 + codestream.get_bits(30)
+        else:
+            match ratio:
+                case 1:
+                    width = height
+                case 2:
+                    width = (height * 12) // 10
+                case 3:
+                    width = (height * 4) // 3
+                case 4:
+                    width = (height * 3) // 2
+                case 5:
+                    width = (height * 16) // 9
+                case 6:
+                    width = (height * 5) // 4
+                case 7:
+                    width = (height * 2) // 1
+    elif (size >= 10) and data[:6] in (b'GIF87a', b'GIF89a'):
         # GIFs
         imgtype = GIF
         w, h = struct.unpack("<HH", data[6:10])

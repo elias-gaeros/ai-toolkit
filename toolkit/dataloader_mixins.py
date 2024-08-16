@@ -25,6 +25,11 @@ import albumentations as A
 
 from toolkit.train_tools import get_torch_dtype
 
+try:
+    import pillow_jxl
+except:
+    pass
+
 if TYPE_CHECKING:
     from toolkit.data_loader import AiToolkitDataset
     from toolkit.data_transfer_object.data_loader import FileItemDTO
@@ -545,7 +550,7 @@ class ControlFileItemDTOMixin:
             self.full_size_control_images = dataset_config.full_size_control_images
             # we are using control images
             img_path = kwargs.get('path', None)
-            img_ext_list = ['.jpg', '.jpeg', '.png', '.webp']
+            img_ext_list = ['.jpg', '.jpeg', '.png', '.jxl', '.webp']
             file_name_no_ext = os.path.splitext(os.path.basename(img_path))[0]
             for ext in img_ext_list:
                 if os.path.exists(os.path.join(control_path, file_name_no_ext + ext)):
@@ -638,7 +643,7 @@ class ClipImageFileItemDTOMixin:
             clip_image_path = dataset_config.clip_image_path
             # we are using control images
             img_path = kwargs.get('path', None)
-            img_ext_list = ['.jpg', '.jpeg', '.png', '.webp']
+            img_ext_list = ['.jpg', '.jpeg', '.png', '.jxl', '.webp']
             file_name_no_ext = os.path.splitext(os.path.basename(img_path))[0]
             for ext in img_ext_list:
                 if os.path.exists(os.path.join(clip_image_path, file_name_no_ext + ext)):
@@ -932,7 +937,7 @@ class MaskFileItemDTOMixin:
             mask_path = dataset_config.mask_path if dataset_config.mask_path is not None else dataset_config.alpha_mask
             # we are using control images
             img_path = kwargs.get('path', None)
-            img_ext_list = ['.jpg', '.jpeg', '.png', '.webp']
+            img_ext_list = ['.jpg', '.jpeg', '.png', '.jxl', '.webp']
             file_name_no_ext = os.path.splitext(os.path.basename(img_path))[0]
             for ext in img_ext_list:
                 if os.path.exists(os.path.join(mask_path, file_name_no_ext + ext)):
@@ -1036,7 +1041,7 @@ class UnconditionalFileItemDTOMixin:
         if dataset_config.unconditional_path is not None:
             # we are using control images
             img_path = kwargs.get('path', None)
-            img_ext_list = ['.jpg', '.jpeg', '.png', '.webp']
+            img_ext_list = ['.jpg', '.jpeg', '.png', '.jxl', '.webp']
             file_name_no_ext = os.path.splitext(os.path.basename(img_path))[0]
             for ext in img_ext_list:
                 if os.path.exists(os.path.join(dataset_config.unconditional_path, file_name_no_ext + ext)):

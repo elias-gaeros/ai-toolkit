@@ -87,7 +87,7 @@ class ImageDataset(Dataset, CaptionMixin):
 
         self.resolution = self.get_config('resolution', 256)
         self.file_list = [os.path.join(self.path, file) for file in os.listdir(self.path) if
-                          file.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))]
+                          file.lower().endswith(('.jpg', '.jpeg', '.png', '.jxl', '.webp'))]
 
         # this might take a while
         print(f"  -  Preprocessing image dimensions")
@@ -221,7 +221,7 @@ class PairedImageDataset(Dataset):
         self.pos_weight = self.get_config('pos_weight', self.network_weight)
         self.neg_weight = self.get_config('neg_weight', self.network_weight)
 
-        supported_exts = ('.jpg', '.jpeg', '.png', '.webp', '.JPEG', '.JPG', '.PNG', '.WEBP')
+        supported_exts = ('.jpg', '.jpeg', '.png', '.jxl', '.webp', '.JPEG', '.JPG', '.PNG', '.WEBP')
 
         if self.pos_folder is not None and self.neg_folder is not None:
             # find matching files
@@ -405,7 +405,7 @@ class AiToolkitDataset(LatentCachingMixin, CLIPCachingMixin, BucketsMixin, Capti
 
         # check if dataset_path is a folder or json
         if os.path.isdir(self.dataset_path):
-            file_list = [os.path.join(root, file) for root, _, files in os.walk(self.dataset_path) for file in files if file.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))]
+            file_list = [os.path.join(root, file) for root, _, files in os.walk(self.dataset_path) for file in files if file.lower().endswith(('.jpg', '.jpeg', '.png', '.jxl', '.webp'))]
         else:
             # assume json
             with open(self.dataset_path, 'r') as f:
