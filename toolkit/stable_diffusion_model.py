@@ -658,7 +658,7 @@ class StableDiffusion:
         self.vae: 'AutoencoderKL' = pipe.vae.to(self.vae_device_torch, dtype=self.vae_torch_dtype)
         self.vae.eval()
         self.vae.requires_grad_(False)
-        VAE_SCALE_FACTOR = 2 ** (len(self.vae.config['block_out_channels']) - 1)
+        VAE_SCALE_FACTOR = pipe.vae_scale_factor
         self.vae_scale_factor = VAE_SCALE_FACTOR
         self.unet.to(self.device_torch, dtype=dtype)
         self.unet.requires_grad_(False)
@@ -1284,7 +1284,7 @@ class StableDiffusion:
             batch_size=1,
             noise_offset=0.0,
     ):
-        VAE_SCALE_FACTOR = 2 ** (len(self.vae.config['block_out_channels']) - 1)
+        VAE_SCALE_FACTOR = self.vae_scale_factor
         if height is None and pixel_height is None:
             raise ValueError("height or pixel_height must be specified")
         if width is None and pixel_width is None:
@@ -1294,7 +1294,7 @@ class StableDiffusion:
         if width is None:
             width = pixel_width // VAE_SCALE_FACTOR
 
-        num_channels = self.unet.config['in_channels']
+        num_channels = self.unet.config.in_channels
         if self.is_flux:
             # has 64 channels in for some reason
             num_channels = 16
@@ -1311,7 +1311,7 @@ class StableDiffusion:
         return noise
 
     def get_time_ids_from_latents(self, latents: torch.Tensor, requires_aesthetic_score=False):
-        VAE_SCALE_FACTOR = 2 ** (len(self.vae.config['block_out_channels']) - 1)
+        VAE_SCALE_FACTOR = self.vae_scale_factor
         if self.is_xl:
             bs, ch, h, w = list(latents.shape)
 
