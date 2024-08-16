@@ -53,5 +53,8 @@ def get_all_extensions_process_dict():
     all_extensions = get_all_extensions()
     process_dict = {}
     for extension in all_extensions:
-        process_dict[extension.uid] = extension.get_process()
+        try:
+            process_dict[extension.uid] = extension.get_process()
+        except Exception as e:
+            print(f"Failed to get process for extension {extension.uid}. Error: {str(e)}")
     return process_dict
