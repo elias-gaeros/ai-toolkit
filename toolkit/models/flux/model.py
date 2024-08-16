@@ -38,7 +38,7 @@ class FluxParams:
     axes_dim: list
     theta: int
     qkv_bias: bool
-    guidance_embed: bool
+    guidance_embeds: bool
 
 
 class Flux(nn.Module, ModelMixin):
@@ -65,7 +65,7 @@ class Flux(nn.Module, ModelMixin):
         self.time_in = MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size, dtype=dtype, device=device, operations=operations)
         self.vector_in = MLPEmbedder(params.vec_in_dim, self.hidden_size, dtype=dtype, device=device, operations=operations)
         self.guidance_in = (
-            MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size, dtype=dtype, device=device, operations=operations) if params.guidance_embed else nn.Identity()
+            MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size, dtype=dtype, device=device, operations=operations) if params.guidance_embeds else nn.Identity()
         )
         self.txt_in = operations.Linear(params.context_in_dim, self.hidden_size, dtype=dtype, device=device)
 
@@ -111,7 +111,7 @@ class Flux(nn.Module, ModelMixin):
         img = self.img_in(img)
         
         vec = self.time_in(timestep_embedding(timesteps, 256).to(img.dtype))
-        if self.config.guidance_embed:
+        if self.config.guidance_embeds:
             if guidance is None:
                 raise ValueError("Didn't get guidance strength for guidance distilled model.")
             vec = vec + self.guidance_in(timestep_embedding(guidance, 256).to(img.dtype))
