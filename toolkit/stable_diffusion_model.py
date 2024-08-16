@@ -1756,7 +1756,7 @@ class StableDiffusion:
                     cast_dtype = self.unet.dtype
                     # with torch.amp.autocast(device_type='cuda', dtype=cast_dtype):
                     if isinstance(self.unet, flux.Flux):
-                        noise_pred = self.unet.forward_orig(
+                        noise_pred = self.unet.forward(
                             img=latent_model_input_packed.to(self.device_torch, cast_dtype),  # [1, 4096, 64]                        
                             img_ids=img_ids,  # [1, 4096, 3]
                             txt=text_embeddings.text_embeds.to(self.device_torch, cast_dtype),

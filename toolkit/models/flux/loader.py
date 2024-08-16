@@ -115,7 +115,7 @@ class CombinedCheckpoint(Configs):
 
         params = self.get_flux_config(state_dict)
         with accelerate.init_empty_weights():
-            transformer = Flux(params, operations=torch.nn)
+            transformer = Flux(params)
         load_quantized_statedict(transformer, state_dict, device=device or self.device)
 
         return transformer
