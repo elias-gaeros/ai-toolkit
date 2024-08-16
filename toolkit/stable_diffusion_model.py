@@ -1,23 +1,15 @@
 import copy
 import gc
 import json
-import random
 import shutil
-import typing
 from typing import Union, List, Literal, Iterator
-import sys
 import os
 from collections import OrderedDict
 import copy
 import yaml
 from PIL import Image
-from diffusers.pipelines.pixart_alpha.pipeline_pixart_sigma import ASPECT_RATIO_1024_BIN, ASPECT_RATIO_512_BIN, \
-    ASPECT_RATIO_2048_BIN, ASPECT_RATIO_256_BIN
 from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import rescale_noise_cfg
-from safetensors.torch import save_file, load_file
-from torch import autocast
 from torch.nn import Parameter
-from torch.utils.checkpoint import checkpoint
 from tqdm import tqdm
 from torchvision.transforms import Resize, transforms
 
@@ -25,17 +17,15 @@ from toolkit.assistant_lora import load_assistant_lora_from_path
 from toolkit.clip_vision_adapter import ClipVisionAdapter
 from toolkit.custom_adapter import CustomAdapter
 from toolkit.ip_adapter import IPAdapter
-from library.model_util import convert_unet_state_dict_to_sd, convert_text_encoder_state_dict_to_sd_v2, \
-    convert_vae_state_dict, load_vae
+from library.model_util import load_vae
 from toolkit import train_tools
 from toolkit.config_modules import ModelConfig, GenerateImageConfig
-from toolkit.metadata import get_meta_for_safetensors
-from toolkit.paths import REPOS_ROOT, KEYMAPS_ROOT
+from toolkit.paths import KEYMAPS_ROOT
 from toolkit.prompt_utils import inject_trigger_into_prompt, PromptEmbeds, concat_prompt_embeds
 from toolkit.reference_adapter import ReferenceAdapter
 from toolkit.sampler import get_sampler
 from toolkit.samplers.custom_flowmatch_sampler import CustomFlowMatchEulerDiscreteScheduler
-from toolkit.saving import save_ldm_model_from_diffusers, get_ldm_state_dict_from_diffusers
+from toolkit.saving import save_ldm_model_from_diffusers
 from toolkit.sd_device_states_presets import empty_preset
 from toolkit.train_tools import get_torch_dtype, apply_noise_offset
 from toolkit.models.flux.loader import CombinedCheckpoint
@@ -43,24 +33,17 @@ from toolkit.models.flux.pipe import FluxPipeline as BflFluxPipeline
 from toolkit.models import flux
 from einops import rearrange, repeat
 import torch
-from toolkit.pipelines import CustomStableDiffusionXLPipeline, CustomStableDiffusionPipeline, \
-    StableDiffusionKDiffusionXLPipeline, StableDiffusionXLRefinerPipeline, FluxWithCFGPipeline
+from toolkit.pipelines import CustomStableDiffusionXLPipeline, FluxWithCFGPipeline
 from diffusers import StableDiffusionPipeline, StableDiffusionXLPipeline, T2IAdapter, DDPMScheduler, \
-    StableDiffusionXLAdapterPipeline, StableDiffusionAdapterPipeline, DiffusionPipeline, PixArtTransformer2DModel, \
-    StableDiffusionXLImg2ImgPipeline, LCMScheduler, Transformer2DModel, AutoencoderTiny, ControlNetModel, \
-    StableDiffusionXLControlNetPipeline, StableDiffusionControlNetPipeline, StableDiffusion3Pipeline, \
-    StableDiffusion3Img2ImgPipeline, PixArtSigmaPipeline, AuraFlowPipeline, AuraFlowTransformer2DModel, FluxPipeline, \
-    FluxTransformer2DModel, FlowMatchEulerDiscreteScheduler
+    LCMScheduler, AutoencoderTiny, ControlNetModel, \
+    FlowMatchEulerDiscreteScheduler
 import diffusers
 from diffusers import \
     AutoencoderKL, \
     UNet2DConditionModel
-from diffusers import PixArtAlphaPipeline, DPMSolverMultistepScheduler, PixArtSigmaPipeline
-from transformers import T5EncoderModel, BitsAndBytesConfig, UMT5EncoderModel, T5TokenizerFast
+from diffusers import PixArtAlphaPipeline
+from transformers import T5EncoderModel, UMT5EncoderModel
 from transformers import CLIPTextModel, CLIPTokenizer, CLIPTextModelWithProjection
-
-from toolkit.paths import ORIG_CONFIGS_ROOT, DIFFUSERS_CONFIGS_ROOT
-from huggingface_hub import hf_hub_download
 
 from optimum.quanto import freeze, qfloat8, quantize, QTensor, qint4
 from typing import TYPE_CHECKING
@@ -114,11 +97,6 @@ class BlankNetwork:
 def flush():
     torch.cuda.empty_cache()
     gc.collect()
-
-
-UNET_IN_CHANNELS = 4  # Stable Diffusion の in_channels は 4 で固定。XLも同じ。
-# VAE_SCALE_FACTOR = 8  # 2 ** (len(vae.config.block_out_channels) - 1) = 8
-
 
 
 class StableDiffusion:
@@ -216,263 +194,13 @@ class StableDiffusion:
         if self.model_config.vae_path is not None:
             load_args['vae'] = load_vae(self.model_config.vae_path, dtype)
         if self.model_config.is_xl or self.model_config.is_ssd or self.model_config.is_vega:
-            if self.custom_pipeline is not None:
-                pipln = self.custom_pipeline
-            else:
-                pipln = StableDiffusionXLPipeline
-                # pipln = StableDiffusionKDiffusionXLPipeline
-
-            # see if path exists
-            if not os.path.exists(model_path) or os.path.isdir(model_path):
-                # try to load with default diffusers
-                pipe = pipln.from_pretrained(
-                    model_path,
-                    dtype=dtype,
-                    device=self.device_torch,
-                    # variant="fp16",
-                    use_safetensors=True,
-                    **load_args
-                )
-            else:
-                pipe = pipln.from_single_file(
-                    model_path,
-                    device=self.device_torch,
-                    torch_dtype=self.torch_dtype,
-                )
-
-            if 'vae' in load_args and load_args['vae'] is not None:
-                pipe.vae = load_args['vae']
-            flush()
-
-            text_encoders = [pipe.text_encoder, pipe.text_encoder_2]
-            tokenizer = [pipe.tokenizer, pipe.tokenizer_2]
-            for text_encoder in text_encoders:
-                text_encoder.to(self.te_device_torch, dtype=self.te_torch_dtype)
-                text_encoder.requires_grad_(False)
-                text_encoder.eval()
-            text_encoder = text_encoders
-
-            pipe.vae = pipe.vae.to(self.vae_device_torch, dtype=self.vae_torch_dtype)
-
-            if self.model_config.experimental_xl:
-                print("Experimental XL mode enabled")
-                print("Loading and injecting alt weights")
-                # load the mismatched weight and force it in
-                raw_state_dict = load_file(model_path)
-                replacement_weight = raw_state_dict['conditioner.embedders.1.model.text_projection'].clone()
-                del raw_state_dict
-                #  get state dict for  for 2nd text encoder
-                te1_state_dict = text_encoders[1].state_dict()
-                # replace weight with mismatched weight
-                te1_state_dict['text_projection.weight'] = replacement_weight.to(self.device_torch, dtype=dtype)
-                flush()
-                print("Injecting alt weights")
+            assert False
         elif self.model_config.is_v3:
-            if self.custom_pipeline is not None:
-                pipln = self.custom_pipeline
-            else:
-                pipln = StableDiffusion3Pipeline
-
-            quantization_config = BitsAndBytesConfig(load_in_8bit=True)
-
-            model_id = "stabilityai/stable-diffusion-3-medium"
-            text_encoder3 = T5EncoderModel.from_pretrained(
-                model_id,
-                subfolder="text_encoder_3",
-                # quantization_config=quantization_config,
-                revision="refs/pr/26",
-                device_map="cuda"
-            )
-
-            # see if path exists
-            if not os.path.exists(model_path) or os.path.isdir(model_path):
-                try:
-                    # try to load with default diffusers
-                    pipe = pipln.from_pretrained(
-                        model_path,
-                        dtype=dtype,
-                        device=self.device_torch,
-                        text_encoder_3=text_encoder3,
-                        # variant="fp16",
-                        use_safetensors=True,
-                        revision="refs/pr/26",
-                        repo_type="model",
-                        ignore_patterns=["*.md", "*..gitattributes"],
-                        **load_args
-                    )
-                except Exception as e:
-                    print(f"Error loading from pretrained: {e}")
-                    raise e
-
-            else:
-                pipe = pipln.from_single_file(
-                    model_path,
-                    device=self.device_torch,
-                    torch_dtype=self.torch_dtype,
-                    text_encoder_3=text_encoder3,
-                    **load_args
-                )
-
-            flush()
-
-            text_encoders = [pipe.text_encoder, pipe.text_encoder_2, pipe.text_encoder_3]
-            tokenizer = [pipe.tokenizer, pipe.tokenizer_2, pipe.tokenizer_3]
-            # replace the to function with a no-op since it throws an error instead of a warning
-            # text_encoders[2].to = lambda *args, **kwargs: None
-            for text_encoder in text_encoders:
-                text_encoder.to(self.device_torch, dtype=dtype)
-                text_encoder.requires_grad_(False)
-                text_encoder.eval()
-            text_encoder = text_encoders
-
-
+            assert False
         elif self.model_config.is_pixart:
-            te_kwargs = {}
-            # handle quantization of TE
-            te_is_quantized = False
-            if self.model_config.text_encoder_bits == 8:
-                te_kwargs['load_in_8bit'] = True
-                te_kwargs['device_map'] = "auto"
-                te_is_quantized = True
-            elif self.model_config.text_encoder_bits == 4:
-                te_kwargs['load_in_4bit'] = True
-                te_kwargs['device_map'] = "auto"
-                te_is_quantized = True
-
-            main_model_path = "PixArt-alpha/PixArt-XL-2-1024-MS"
-            if self.model_config.is_pixart_sigma:
-                main_model_path = "PixArt-alpha/pixart_sigma_sdxlvae_T5_diffusers"
-
-            main_model_path = model_path
-
-            # load the TE in 8bit mode
-            text_encoder = T5EncoderModel.from_pretrained(
-                main_model_path,
-                subfolder="text_encoder",
-                torch_dtype=self.torch_dtype,
-                **te_kwargs
-            )
-
-            # load the transformer
-            subfolder = "transformer"
-            # check if it is just the unet
-            if os.path.exists(model_path) and not os.path.exists(os.path.join(model_path, subfolder)):
-                subfolder = None
-
-            if te_is_quantized:
-                # replace the to function with a no-op since it throws an error instead of a warning
-                text_encoder.to = lambda *args, **kwargs: None
-
-            text_encoder.to(self.te_device_torch, dtype=self.te_torch_dtype)
-
-            if self.model_config.is_pixart_sigma:
-                # load the transformer only from the save
-                transformer = Transformer2DModel.from_pretrained(
-                    model_path if self.model_config.unet_path is None else self.model_config.unet_path,
-                    torch_dtype=self.torch_dtype,
-                    subfolder='transformer'
-                )
-                pipe: PixArtSigmaPipeline = PixArtSigmaPipeline.from_pretrained(
-                    main_model_path,
-                    transformer=transformer,
-                    text_encoder=text_encoder,
-                    dtype=dtype,
-                    device=self.device_torch,
-                    **load_args
-                )
-
-            else:
-
-                # load the transformer only from the save
-                transformer = Transformer2DModel.from_pretrained(model_path, torch_dtype=self.torch_dtype,
-                                                                 subfolder=subfolder)
-                pipe: PixArtAlphaPipeline = PixArtAlphaPipeline.from_pretrained(
-                    main_model_path,
-                    transformer=transformer,
-                    text_encoder=text_encoder,
-                    dtype=dtype,
-                    device=self.device_torch,
-                    **load_args
-                ).to(self.device_torch)
-
-            if self.model_config.unet_sample_size is not None:
-                pipe.transformer.config.sample_size = self.model_config.unet_sample_size
-            pipe.transformer = pipe.transformer.to(self.device_torch, dtype=dtype)
-
-            flush()
-            # text_encoder = pipe.text_encoder
-            # text_encoder.to(self.device_torch, dtype=dtype)
-            text_encoder.requires_grad_(False)
-            text_encoder.eval()
-            pipe.transformer = pipe.transformer.to(self.device_torch, dtype=dtype)
-            tokenizer = pipe.tokenizer
-
-            pipe.vae = pipe.vae.to(self.vae_device_torch, dtype=self.vae_torch_dtype)
-            if self.noise_scheduler is None:
-                self.noise_scheduler = pipe.scheduler
-
-
+            assert False
         elif self.model_config.is_auraflow:
-            te_kwargs = {}
-            # handle quantization of TE
-            te_is_quantized = False
-            if self.model_config.text_encoder_bits == 8:
-                te_kwargs['load_in_8bit'] = True
-                te_kwargs['device_map'] = "auto"
-                te_is_quantized = True
-            elif self.model_config.text_encoder_bits == 4:
-                te_kwargs['load_in_4bit'] = True
-                te_kwargs['device_map'] = "auto"
-                te_is_quantized = True
-
-            main_model_path = model_path
-
-            # load the TE in 8bit mode
-            text_encoder = UMT5EncoderModel.from_pretrained(
-                main_model_path,
-                subfolder="text_encoder",
-                torch_dtype=self.torch_dtype,
-                **te_kwargs
-            )
-
-            # load the transformer
-            subfolder = "transformer"
-            # check if it is just the unet
-            if os.path.exists(model_path) and not os.path.exists(os.path.join(model_path, subfolder)):
-                subfolder = None
-
-            if te_is_quantized:
-                # replace the to function with a no-op since it throws an error instead of a warning
-                text_encoder.to = lambda *args, **kwargs: None
-
-            # load the transformer only from the save
-            transformer = AuraFlowTransformer2DModel.from_pretrained(
-                model_path if self.model_config.unet_path is None else self.model_config.unet_path,
-                torch_dtype=self.torch_dtype,
-                subfolder='transformer'
-            )
-            pipe: AuraFlowPipeline = AuraFlowPipeline.from_pretrained(
-                main_model_path,
-                transformer=transformer,
-                text_encoder=text_encoder,
-                dtype=dtype,
-                device=self.device_torch,
-                **load_args
-            )
-
-            pipe.transformer = pipe.transformer.to(self.device_torch, dtype=dtype)
-
-            # patch auraflow so it can handle other aspect ratios
-            # patch_auraflow_pos_embed(pipe.transformer.pos_embed)
-
-            flush()
-            # text_encoder = pipe.text_encoder
-            # text_encoder.to(self.device_torch, dtype=dtype)
-            text_encoder.requires_grad_(False)
-            text_encoder.eval()
-            pipe.transformer = pipe.transformer.to(self.device_torch, dtype=dtype)
-            tokenizer = pipe.tokenizer
-
+            assert False
         elif self.model_config.is_flux:
             print('Loading checkpoint')
             checkpoint = CombinedCheckpoint(model_path)
@@ -509,70 +237,7 @@ class StableDiffusion:
             pipe.transformer = pipe.transformer.to(self.device_torch)
             flush()
         else:
-            if self.custom_pipeline is not None:
-                pipln = self.custom_pipeline
-            else:
-                pipln = StableDiffusionPipeline
-
-            if self.model_config.text_encoder_bits < 16:
-                # this is only supported for T5 models for now
-                te_kwargs = {}
-                # handle quantization of TE
-                te_is_quantized = False
-                if self.model_config.text_encoder_bits == 8:
-                    te_kwargs['load_in_8bit'] = True
-                    te_kwargs['device_map'] = "auto"
-                    te_is_quantized = True
-                elif self.model_config.text_encoder_bits == 4:
-                    te_kwargs['load_in_4bit'] = True
-                    te_kwargs['device_map'] = "auto"
-                    te_is_quantized = True
-
-                text_encoder = T5EncoderModel.from_pretrained(
-                    model_path,
-                    subfolder="text_encoder",
-                    torch_dtype=self.te_torch_dtype,
-                    **te_kwargs
-                )
-                # replace the to function with a no-op since it throws an error instead of a warning
-                text_encoder.to = lambda *args, **kwargs: None
-
-                load_args['text_encoder'] = text_encoder
-
-            # see if path exists
-            if not os.path.exists(model_path) or os.path.isdir(model_path):
-                # try to load with default diffusers
-                pipe = pipln.from_pretrained(
-                    model_path,
-                    dtype=dtype,
-                    device=self.device_torch,
-                    load_safety_checker=False,
-                    requires_safety_checker=False,
-                    safety_checker=None,
-                    # variant="fp16",
-                    trust_remote_code=True,
-                    **load_args
-                )
-            else:
-                pipe = pipln.from_single_file(
-                    model_path,
-                    dtype=dtype,
-                    device=self.device_torch,
-                    load_safety_checker=False,
-                    requires_safety_checker=False,
-                    torch_dtype=self.torch_dtype,
-                    safety_checker=None,
-                    trust_remote_code=True,
-                    **load_args
-                )
-            flush()
-
-            pipe.register_to_config(requires_safety_checker=False)
-            text_encoder = pipe.text_encoder
-            text_encoder.to(self.te_device_torch, dtype=self.te_torch_dtype)
-            text_encoder.requires_grad_(False)
-            text_encoder.eval()
-            tokenizer = pipe.tokenizer
+            assert False
 
         # scheduler doesn't get set sometimes, so we set it here
         pipe.scheduler = self.noise_scheduler
@@ -604,7 +269,6 @@ class StableDiffusion:
         self.tokenizer = tokenizer
         self.text_encoder = text_encoder
         self.pipeline = pipe
-        self.load_refiner()
         self.is_loaded = True
 
         if self.model_config.assistant_lora_path is not None:
@@ -618,17 +282,7 @@ class StableDiffusion:
                 self.assistant_lora.is_active = False
 
         if self.is_pixart and self.vae_scale_factor == 16:
-            # TODO make our own pipeline?
-            # we generate an image 2x larger, so we need to copy the sizes from larger ones down
-            # ASPECT_RATIO_1024_BIN, ASPECT_RATIO_512_BIN, ASPECT_RATIO_2048_BIN, ASPECT_RATIO_256_BIN
-            for key in ASPECT_RATIO_256_BIN.keys():
-                ASPECT_RATIO_256_BIN[key] = [ASPECT_RATIO_256_BIN[key][0] * 2, ASPECT_RATIO_256_BIN[key][1] * 2]
-            for key in ASPECT_RATIO_512_BIN.keys():
-                ASPECT_RATIO_512_BIN[key] = [ASPECT_RATIO_512_BIN[key][0] * 2, ASPECT_RATIO_512_BIN[key][1] * 2]
-            for key in ASPECT_RATIO_1024_BIN.keys():
-                ASPECT_RATIO_1024_BIN[key] = [ASPECT_RATIO_1024_BIN[key][0] * 2, ASPECT_RATIO_1024_BIN[key][1] * 2]
-            for key in ASPECT_RATIO_2048_BIN.keys():
-                ASPECT_RATIO_2048_BIN[key] = [ASPECT_RATIO_2048_BIN[key][0] * 2, ASPECT_RATIO_2048_BIN[key][1] * 2]
+            assert False
 
     def te_train(self):
         if isinstance(self.text_encoder, list):
@@ -643,37 +297,6 @@ class StableDiffusion:
                 te.eval()
         else:
             self.text_encoder.eval()
-
-    def load_refiner(self):
-        # for now, we are just going to rely on the TE from the base model
-        # which is TE2 for SDXL and TE for SD (no refiner currently)
-        # and completely ignore a TE that may or may not be packaged with the refiner
-        if self.model_config.refiner_name_or_path is not None:
-            refiner_config_path = os.path.join(ORIG_CONFIGS_ROOT, 'sd_xl_refiner.yaml')
-            # load the refiner model
-            dtype = get_torch_dtype(self.dtype)
-            model_path = self.model_config.refiner_name_or_path
-            if not os.path.exists(model_path) or os.path.isdir(model_path):
-                # TODO only load unet??
-                refiner = StableDiffusionXLImg2ImgPipeline.from_pretrained(
-                    model_path,
-                    dtype=dtype,
-                    device=self.device_torch,
-                    # variant="fp16",
-                    use_safetensors=True,
-                ).to(self.device_torch)
-            else:
-                refiner = StableDiffusionXLImg2ImgPipeline.from_single_file(
-                    model_path,
-                    dtype=dtype,
-                    device=self.device_torch,
-                    torch_dtype=self.torch_dtype,
-                    original_config_file=refiner_config_path,
-                ).to(self.device_torch)
-
-            self.refiner_unet = refiner.unet
-            del refiner
-            flush()
 
     @torch.no_grad()
     def generate_images(
@@ -739,48 +362,21 @@ class StableDiffusion:
 
             if sampler.startswith("sample_") and self.is_xl:
                 # using kdiffusion
-                Pipe = StableDiffusionKDiffusionXLPipeline
+                assert False
             elif self.is_xl:
-                Pipe = StableDiffusionXLPipeline
+                assert False
             elif self.is_v3:
-                Pipe = StableDiffusion3Pipeline
+                assert False
             else:
                 Pipe = StableDiffusionPipeline
 
             extra_args = {}
             if self.adapter is not None:
-                if isinstance(self.adapter, T2IAdapter):
-                    if self.is_xl:
-                        Pipe = StableDiffusionXLAdapterPipeline
-                    else:
-                        Pipe = StableDiffusionAdapterPipeline
-                    extra_args['adapter'] = self.adapter
-                elif isinstance(self.adapter, ControlNetModel):
-                    if self.is_xl:
-                        Pipe = StableDiffusionXLControlNetPipeline
-                    else:
-                        Pipe = StableDiffusionControlNetPipeline
-                    extra_args['controlnet'] = self.adapter
-                elif isinstance(self.adapter, ReferenceAdapter):
-                    # pass the noise scheduler to the adapter
-                    self.adapter.noise_scheduler = noise_scheduler
-                else:
-                    if self.is_xl:
-                        extra_args['add_watermarker'] = False
+                assert False
 
             # TODO add clip skip
             if self.is_xl:
-                pipeline = Pipe(
-                    vae=self.vae,
-                    unet=self.unet,
-                    text_encoder=self.text_encoder[0],
-                    text_encoder_2=self.text_encoder[1],
-                    tokenizer=self.tokenizer[0],
-                    tokenizer_2=self.tokenizer[1],
-                    scheduler=noise_scheduler,
-                    **extra_args
-                ).to(self.device_torch)
-                pipeline.watermark = None
+                assert False
             elif self.is_flux:
                 if self.model_config.use_flux_cfg:
                     pipeline = FluxWithCFGPipeline(
@@ -807,50 +403,15 @@ class StableDiffusion:
                     )
                 pipeline.watermark = None
             elif self.is_v3:
-                pipeline = Pipe(
-                    vae=self.vae,
-                    transformer=self.unet,
-                    text_encoder=self.text_encoder[0],
-                    text_encoder_2=self.text_encoder[1],
-                    text_encoder_3=self.text_encoder[2],
-                    tokenizer=self.tokenizer[0],
-                    tokenizer_2=self.tokenizer[1],
-                    tokenizer_3=self.tokenizer[2],
-                    scheduler=noise_scheduler,
-                    **extra_args
-                )
+                assert False
             elif self.is_pixart:
-                pipeline = PixArtSigmaPipeline(
-                    vae=self.vae,
-                    transformer=self.unet,
-                    text_encoder=self.text_encoder,
-                    tokenizer=self.tokenizer,
-                    scheduler=noise_scheduler,
-                    **extra_args
-                )
+                assert False
 
             elif self.is_auraflow:
-                pipeline = AuraFlowPipeline(
-                    vae=self.vae,
-                    transformer=self.unet,
-                    text_encoder=self.text_encoder,
-                    tokenizer=self.tokenizer,
-                    scheduler=noise_scheduler,
-                    **extra_args
-                )
+                assert False
 
             else:
-                pipeline = Pipe(
-                    vae=self.vae,
-                    unet=self.unet,
-                    text_encoder=self.text_encoder,
-                    tokenizer=self.tokenizer,
-                    scheduler=noise_scheduler,
-                    safety_checker=None,
-                    feature_extractor=None,
-                    requires_safety_checker=False,
-                    **extra_args
-                )
+                assert False
             flush()
             # disable progress bar
             pipeline.set_progress_bar_config(disable=True)
@@ -860,22 +421,7 @@ class StableDiffusion:
 
         refiner_pipeline = None
         if self.refiner_unet:
-            # build refiner pipeline
-            refiner_pipeline = StableDiffusionXLImg2ImgPipeline(
-                vae=pipeline.vae,
-                unet=self.refiner_unet,
-                text_encoder=None,
-                text_encoder_2=pipeline.text_encoder_2,
-                tokenizer=None,
-                tokenizer_2=pipeline.tokenizer_2,
-                scheduler=pipeline.scheduler,
-                add_watermarker=False,
-                requires_aesthetics_score=True,
-            ).to(self.device_torch)
-            # refiner_pipeline.register_to_config(requires_aesthetics_score=False)
-            refiner_pipeline.watermark = None
-            refiner_pipeline.set_progress_bar_config(disable=True)
-            flush()
+            assert False
 
         start_multiplier = 1.0
         if self.network is not None:
@@ -1030,51 +576,9 @@ class StableDiffusion:
                         unconditional_embeds = unconditional_embeds.text_embeds
 
                     if self.is_xl:
-                        # fix guidance rescale for sdxl
-                        # was trained on 0.7 (I believe)
-
-                        grs = gen_config.guidance_rescale
-                        # if grs is None or grs < 0.00001:
-                        #     grs = 0.7
-                        # grs = 0.0
-
-                        if sampler.startswith("sample_"):
-                            extra['use_karras_sigmas'] = True
-                            extra = {
-                                **extra,
-                                **gen_config.extra_kwargs,
-                            }
-
-                        img = pipeline(
-                            # prompt=gen_config.prompt,
-                            # prompt_2=gen_config.prompt_2,
-                            prompt_embeds=conditional_embeds.text_embeds,
-                            pooled_prompt_embeds=conditional_embeds.pooled_embeds,
-                            negative_prompt_embeds=unconditional_embeds.text_embeds,
-                            negative_pooled_prompt_embeds=unconditional_embeds.pooled_embeds,
-                            # negative_prompt=gen_config.negative_prompt,
-                            # negative_prompt_2=gen_config.negative_prompt_2,
-                            height=gen_config.height,
-                            width=gen_config.width,
-                            num_inference_steps=gen_config.num_inference_steps,
-                            guidance_scale=gen_config.guidance_scale,
-                            guidance_rescale=grs,
-                            latents=gen_config.latents,
-                            **extra
-                        ).images[0]
+                        assert False
                     elif self.is_v3:
-                        img = pipeline(
-                            prompt_embeds=conditional_embeds.text_embeds,
-                            pooled_prompt_embeds=conditional_embeds.pooled_embeds,
-                            negative_prompt_embeds=unconditional_embeds.text_embeds,
-                            negative_pooled_prompt_embeds=unconditional_embeds.pooled_embeds,
-                            height=gen_config.height,
-                            width=gen_config.width,
-                            num_inference_steps=gen_config.num_inference_steps,
-                            guidance_scale=gen_config.guidance_scale,
-                            latents=gen_config.latents,
-                            **extra
-                        ).images[0]
+                        assert False
                     elif self.is_flux:
                         if self.model_config.use_flux_cfg:
                             img = pipeline(
@@ -1103,84 +607,13 @@ class StableDiffusion:
                                 **extra
                             ).images[0]
                     elif self.is_pixart:
-                        # needs attention masks for some reason
-                        img = pipeline(
-                            prompt=None,
-                            prompt_embeds=conditional_embeds.text_embeds.to(self.device_torch, dtype=self.unet.dtype),
-                            prompt_attention_mask=conditional_embeds.attention_mask.to(self.device_torch,
-                                                                                       dtype=self.unet.dtype),
-                            negative_prompt_embeds=unconditional_embeds.text_embeds.to(self.device_torch,
-                                                                                       dtype=self.unet.dtype),
-                            negative_prompt_attention_mask=unconditional_embeds.attention_mask.to(self.device_torch,
-                                                                                                  dtype=self.unet.dtype),
-                            negative_prompt=None,
-                            # negative_prompt=gen_config.negative_prompt,
-                            height=gen_config.height,
-                            width=gen_config.width,
-                            num_inference_steps=gen_config.num_inference_steps,
-                            guidance_scale=gen_config.guidance_scale,
-                            latents=gen_config.latents,
-                            **extra
-                        ).images[0]
+                        assert False
                     elif self.is_auraflow:
-                        pipeline: AuraFlowPipeline = pipeline
-
-                        img = pipeline(
-                            prompt=None,
-                            prompt_embeds=conditional_embeds.text_embeds.to(self.device_torch, dtype=self.unet.dtype),
-                            prompt_attention_mask=conditional_embeds.attention_mask.to(self.device_torch,
-                                                                                       dtype=self.unet.dtype),
-                            negative_prompt_embeds=unconditional_embeds.text_embeds.to(self.device_torch,
-                                                                                       dtype=self.unet.dtype),
-                            negative_prompt_attention_mask=unconditional_embeds.attention_mask.to(self.device_torch,
-                                                                                                  dtype=self.unet.dtype),
-                            negative_prompt=None,
-                            # negative_prompt=gen_config.negative_prompt,
-                            height=gen_config.height,
-                            width=gen_config.width,
-                            num_inference_steps=gen_config.num_inference_steps,
-                            guidance_scale=gen_config.guidance_scale,
-                            latents=gen_config.latents,
-                            **extra
-                        ).images[0]
+                        assert False
                     else:
-                        img = pipeline(
-                            # prompt=gen_config.prompt,
-                            prompt_embeds=conditional_embeds.text_embeds,
-                            negative_prompt_embeds=unconditional_embeds.text_embeds,
-                            # negative_prompt=gen_config.negative_prompt,
-                            height=gen_config.height,
-                            width=gen_config.width,
-                            num_inference_steps=gen_config.num_inference_steps,
-                            guidance_scale=gen_config.guidance_scale,
-                            latents=gen_config.latents,
-                            **extra
-                        ).images[0]
-
+                        assert False
                     if self.refiner_unet is not None and gen_config.refiner_start_at < 1.0:
-                        # slide off just the last 1280 on the last dim as refiner does not use first text encoder
-                        # todo, should we just use the Text encoder for the refiner? Fine tuned versions will differ
-                        refiner_text_embeds = conditional_embeds.text_embeds[:, :, -1280:]
-                        refiner_unconditional_text_embeds = unconditional_embeds.text_embeds[:, :, -1280:]
-                        # run through refiner
-                        img = refiner_pipeline(
-                            # prompt=gen_config.prompt,
-                            # prompt_2=gen_config.prompt_2,
-
-                            # slice these as it does not use both text encoders
-                            # height=gen_config.height,
-                            # width=gen_config.width,
-                            prompt_embeds=refiner_text_embeds,
-                            pooled_prompt_embeds=conditional_embeds.pooled_embeds,
-                            negative_prompt_embeds=refiner_unconditional_text_embeds,
-                            negative_pooled_prompt_embeds=unconditional_embeds.pooled_embeds,
-                            num_inference_steps=gen_config.num_inference_steps,
-                            guidance_scale=gen_config.guidance_scale,
-                            guidance_rescale=grs,
-                            denoising_start=gen_config.refiner_start_at,
-                            denoising_end=gen_config.num_inference_steps,
-                            image=img.unsqueeze(0)
-                        ).images[0]
+                        assert False
 
                     gen_config.save_image(img, i)
 
@@ -1396,109 +829,7 @@ class StableDiffusion:
             return torch.cat(out_chunks, dim=0)
 
         if self.is_xl:
-            with torch.no_grad():
-                # 16, 6 for bs of 4
-                if add_time_ids is None:
-                    add_time_ids = self.get_time_ids_from_latents(latents)
-
-                    if do_classifier_free_guidance:
-                        # todo check this with larget batches
-                        add_time_ids = torch.cat([add_time_ids] * 2)
-
-                if do_classifier_free_guidance:
-                    latent_model_input = torch.cat([latents] * 2)
-                    timestep = torch.cat([timestep] * 2)
-                else:
-                    latent_model_input = latents
-
-                latent_model_input = scale_model_input(latent_model_input, timestep)
-
-                added_cond_kwargs = {
-                    # todo can we zero here the second text encoder? or match a blank string?
-                    "text_embeds": text_embeddings.pooled_embeds,
-                    "time_ids": add_time_ids,
-                }
-
-            if self.model_config.refiner_name_or_path is not None:
-                # we have the refiner on the second half of everything. Do Both
-                if do_classifier_free_guidance:
-                    raise ValueError("Refiner is not supported with classifier free guidance")
-
-                if self.unet.training:
-                    input_chunks = torch.chunk(latent_model_input, 2, dim=0)
-                    timestep_chunks = torch.chunk(timestep, 2, dim=0)
-                    added_cond_kwargs_chunked = {
-                        "text_embeds": torch.chunk(text_embeddings.pooled_embeds, 2, dim=0),
-                        "time_ids": torch.chunk(add_time_ids, 2, dim=0),
-                    }
-                    text_embeds_chunks = torch.chunk(text_embeddings.text_embeds, 2, dim=0)
-
-                    # predict the noise residual
-                    base_pred = self.unet(
-                        input_chunks[0],
-                        timestep_chunks[0],
-                        encoder_hidden_states=text_embeds_chunks[0],
-                        added_cond_kwargs={
-                            "text_embeds": added_cond_kwargs_chunked['text_embeds'][0],
-                            "time_ids": added_cond_kwargs_chunked['time_ids'][0],
-                        },
-                        **kwargs,
-                    ).sample
-
-                    refiner_pred = self.refiner_unet(
-                        input_chunks[1],
-                        timestep_chunks[1],
-                        encoder_hidden_states=text_embeds_chunks[1][:, :, -1280:],
-                        # just use the first second text encoder
-                        added_cond_kwargs={
-                            "text_embeds": added_cond_kwargs_chunked['text_embeds'][1],
-                            # "time_ids": added_cond_kwargs_chunked['time_ids'][1],
-                            "time_ids": self.get_time_ids_from_latents(input_chunks[1], requires_aesthetic_score=True),
-                        },
-                        **kwargs,
-                    ).sample
-
-                    noise_pred = torch.cat([base_pred, refiner_pred], dim=0)
-                else:
-                    noise_pred = self.refiner_unet(
-                        latent_model_input,
-                        timestep,
-                        encoder_hidden_states=text_embeddings.text_embeds[:, :, -1280:],
-                        # just use the first second text encoder
-                        added_cond_kwargs={
-                            "text_embeds": text_embeddings.pooled_embeds,
-                            "time_ids": self.get_time_ids_from_latents(latent_model_input,
-                                                                       requires_aesthetic_score=True),
-                        },
-                        **kwargs,
-                    ).sample
-
-            else:
-
-                # predict the noise residual
-                noise_pred = self.unet(
-                    latent_model_input.to(self.device_torch, self.torch_dtype),
-                    timestep,
-                    encoder_hidden_states=text_embeddings.text_embeds,
-                    added_cond_kwargs=added_cond_kwargs,
-                    **kwargs,
-                ).sample
-
-            conditional_pred = noise_pred
-
-            if do_classifier_free_guidance:
-                # perform guidance
-                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                conditional_pred = noise_pred_text
-                noise_pred = noise_pred_uncond + guidance_scale * (
-                        noise_pred_text - noise_pred_uncond
-                )
-
-                # https://github.com/huggingface/diffusers/blob/7a91ea6c2b53f94da930a61ed571364022b21044/src/diffusers/pipelines/stable_diffusion_xl/pipeline_stable_diffusion_xl.py#L775
-                if guidance_rescale > 0.0:
-                    # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
-                    noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=guidance_rescale)
-
+            assert False
         else:
             with torch.no_grad():
                 if do_classifier_free_guidance:
@@ -1524,55 +855,7 @@ class StableDiffusion:
 
             # predict the noise residual
             if self.is_pixart:
-                VAE_SCALE_FACTOR = 2 ** (len(self.vae.config['block_out_channels']) - 1)
-                batch_size, ch, h, w = list(latents.shape)
-
-                height = h * VAE_SCALE_FACTOR
-                width = w * VAE_SCALE_FACTOR
-
-                if self.pipeline.transformer.config.sample_size == 256:
-                    aspect_ratio_bin = ASPECT_RATIO_2048_BIN
-                elif self.pipeline.transformer.config.sample_size == 128:
-                    aspect_ratio_bin = ASPECT_RATIO_1024_BIN
-                elif self.pipeline.transformer.config.sample_size == 64:
-                    aspect_ratio_bin = ASPECT_RATIO_512_BIN
-                elif self.pipeline.transformer.config.sample_size == 32:
-                    aspect_ratio_bin = ASPECT_RATIO_256_BIN
-                else:
-                    raise ValueError(f"Invalid sample size: {self.pipeline.transformer.config.sample_size}")
-                orig_height, orig_width = height, width
-                height, width = self.pipeline.image_processor.classify_height_width_bin(height, width,
-                                                                                        ratios=aspect_ratio_bin)
-
-                added_cond_kwargs = {"resolution": None, "aspect_ratio": None}
-                if self.unet.config.sample_size == 128 or (
-                        self.vae_scale_factor == 16 and self.unet.config.sample_size == 64):
-                    resolution = torch.tensor([height, width]).repeat(batch_size, 1)
-                    aspect_ratio = torch.tensor([float(height / width)]).repeat(batch_size, 1)
-                    resolution = resolution.to(dtype=text_embeddings.text_embeds.dtype, device=self.device_torch)
-                    aspect_ratio = aspect_ratio.to(dtype=text_embeddings.text_embeds.dtype, device=self.device_torch)
-
-                    if do_classifier_free_guidance:
-                        resolution = torch.cat([resolution, resolution], dim=0)
-                        aspect_ratio = torch.cat([aspect_ratio, aspect_ratio], dim=0)
-
-                    added_cond_kwargs = {"resolution": resolution, "aspect_ratio": aspect_ratio}
-
-                noise_pred = self.unet(
-                    latent_model_input.to(self.device_torch, self.torch_dtype),
-                    encoder_hidden_states=text_embeddings.text_embeds,
-                    encoder_attention_mask=text_embeddings.attention_mask,
-                    timestep=timestep,
-                    added_cond_kwargs=added_cond_kwargs,
-                    return_dict=False,
-                    **kwargs
-                )[0]
-
-                # learned sigma
-                if self.unet.config.out_channels // 2 == self.unet.config.in_channels:
-                    noise_pred = noise_pred.chunk(2, dim=1)[0]
-                else:
-                    noise_pred = noise_pred
+                assert False
             else:
                 if self.unet.device != self.device_torch:
                     self.unet.to(self.device_torch)
@@ -1649,32 +932,11 @@ class StableDiffusion:
                         c=latent_model_input.shape[1],
                     )
                 elif self.is_v3:
-                    noise_pred = self.unet(
-                        hidden_states=latent_model_input.to(self.device_torch, self.torch_dtype),
-                        timestep=timestep,
-                        encoder_hidden_states=text_embeddings.text_embeds.to(self.device_torch, self.torch_dtype),
-                        pooled_projections=text_embeddings.pooled_embeds.to(self.device_torch, self.torch_dtype),
-                        **kwargs,
-                    ).sample
+                    assert False
                 elif self.is_auraflow:
-                    # aura use timestep value between 0 and 1, with t=1 as noise and t=0 as the image
-                    # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-                    t = torch.tensor([timestep / 1000]).expand(latent_model_input.shape[0])
-                    t = t.to(self.device_torch, self.torch_dtype)
-
-                    noise_pred = self.unet(
-                        latent_model_input,
-                        encoder_hidden_states=text_embeddings.text_embeds.to(self.device_torch, self.torch_dtype),
-                        timestep=t,
-                        return_dict=False,
-                    )[0]
+                    assert False
                 else:
-                    noise_pred = self.unet(
-                        latent_model_input.to(self.device_torch, self.torch_dtype),
-                        timestep=timestep,
-                        encoder_hidden_states=text_embeddings.text_embeds.to(self.device_torch, self.torch_dtype),
-                        **kwargs,
-                    ).sample
+                    assert False
 
             conditional_pred = noise_pred
 
@@ -1813,67 +1075,13 @@ class StableDiffusion:
         if prompt2 is not None and not isinstance(prompt2, list):
             prompt2 = [prompt2]
         if self.is_xl:
-            # todo make this a config
-            # 50% chance to use an encoder anyway even if it is disabled
-            # allows the other TE to compensate for the disabled one
-            # use_encoder_1 = self.use_text_encoder_1 or force_all or random.random() > 0.5
-            # use_encoder_2 = self.use_text_encoder_2 or force_all or random.random() > 0.5
-            use_encoder_1 = True
-            use_encoder_2 = True
-
-            return PromptEmbeds(
-                train_tools.encode_prompts_xl(
-                    self.tokenizer,
-                    self.text_encoder,
-                    prompt,
-                    prompt2,
-                    num_images_per_prompt=num_images_per_prompt,
-                    use_text_encoder_1=use_encoder_1,
-                    use_text_encoder_2=use_encoder_2,
-                    truncate=not long_prompts,
-                    max_length=max_length,
-                    dropout_prob=dropout_prob,
-                )
-            )
+            assert False
         if self.is_v3:
-            return PromptEmbeds(
-                train_tools.encode_prompts_sd3(
-                    self.tokenizer,
-                    self.text_encoder,
-                    prompt,
-                    num_images_per_prompt=num_images_per_prompt,
-                    truncate=not long_prompts,
-                    max_length=max_length,
-                    dropout_prob=dropout_prob,
-                    pipeline=self.pipeline,
-                )
-            )
+            assert False
         elif self.is_pixart:
-            embeds, attention_mask = train_tools.encode_prompts_pixart(
-                self.tokenizer,
-                self.text_encoder,
-                prompt,
-                truncate=not long_prompts,
-                max_length=300 if self.model_config.is_pixart_sigma else 120,
-                dropout_prob=dropout_prob
-            )
-            return PromptEmbeds(
-                embeds,
-                attention_mask=attention_mask,
-            )
+            assert False
         elif self.is_auraflow:
-            embeds, attention_mask = train_tools.encode_prompts_auraflow(
-                self.tokenizer,
-                self.text_encoder,
-                prompt,
-                truncate=not long_prompts,
-                max_length=256,
-                dropout_prob=dropout_prob
-            )
-            return PromptEmbeds(
-                embeds,
-                attention_mask=attention_mask,  # not used
-            )
+            assert False
         elif self.is_flux:
             if isinstance(self.text_encoder[1], flux.T5):
                 encode_prompts = train_tools.encode_prompts_flux_bfl
@@ -2133,63 +1341,6 @@ class StableDiffusion:
             named_params = new_named_params
 
         return named_params
-
-    def save_refiner(self, output_file: str, meta: OrderedDict, save_dtype=get_torch_dtype('fp16')):
-
-        # load the full refiner since we only train unet
-        if self.model_config.refiner_name_or_path is None:
-            raise ValueError("Refiner must be specified to save it")
-        refiner_config_path = os.path.join(ORIG_CONFIGS_ROOT, 'sd_xl_refiner.yaml')
-        # load the refiner model
-        dtype = get_torch_dtype(self.dtype)
-        model_path = self.model_config._original_refiner_name_or_path
-        if not os.path.exists(model_path) or os.path.isdir(model_path):
-            # TODO only load unet??
-            refiner = StableDiffusionXLImg2ImgPipeline.from_pretrained(
-                model_path,
-                dtype=dtype,
-                device='cpu',
-                # variant="fp16",
-                use_safetensors=True,
-            )
-        else:
-            refiner = StableDiffusionXLImg2ImgPipeline.from_single_file(
-                model_path,
-                dtype=dtype,
-                device='cpu',
-                torch_dtype=self.torch_dtype,
-                original_config_file=refiner_config_path,
-            )
-        # replace original unet
-        refiner.unet = self.refiner_unet
-        flush()
-
-        diffusers_state_dict = OrderedDict()
-        for k, v in refiner.vae.state_dict().items():
-            new_key = k if k.startswith(f"{SD_PREFIX_VAE}") else f"{SD_PREFIX_VAE}_{k}"
-            diffusers_state_dict[new_key] = v
-        for k, v in refiner.text_encoder_2.state_dict().items():
-            new_key = k if k.startswith(f"{SD_PREFIX_TEXT_ENCODER2}_") else f"{SD_PREFIX_TEXT_ENCODER2}_{k}"
-            diffusers_state_dict[new_key] = v
-        for k, v in refiner.unet.state_dict().items():
-            new_key = k if k.startswith(f"{SD_PREFIX_UNET}_") else f"{SD_PREFIX_UNET}_{k}"
-            diffusers_state_dict[new_key] = v
-
-        converted_state_dict = get_ldm_state_dict_from_diffusers(
-            diffusers_state_dict,
-            'sdxl_refiner',
-            device='cpu',
-            dtype=save_dtype
-        )
-
-        # make sure parent folder exists
-        os.makedirs(os.path.dirname(output_file), exist_ok=True)
-        save_file(converted_state_dict, output_file, metadata=meta)
-
-        if self.config_file is not None:
-            output_path_no_ext = os.path.splitext(output_file)[0]
-            output_config_path = f"{output_path_no_ext}.yaml"
-            shutil.copyfile(self.config_file, output_config_path)
 
     def save(self, output_file: str, meta: OrderedDict, save_dtype=get_torch_dtype('fp16'), logit_scale=None):
         version_string = '1'
