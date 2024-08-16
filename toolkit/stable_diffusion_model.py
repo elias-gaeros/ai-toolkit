@@ -1023,11 +1023,14 @@ class StableDiffusion:
 
                     if isinstance(self.adapter, CustomAdapter):
                         self.adapter.is_unconditional_run = True
-                    unconditional_embeds = self.encode_prompt(
-                        gen_config.negative_prompt, gen_config.negative_prompt_2, force_all=True
-                    )
-                    if isinstance(self.adapter, CustomAdapter):
-                        self.adapter.is_unconditional_run = False
+                    if self.is_flux and not self.model_config.use_flux_cfg:
+                        unconditional_embeds = None
+                    else:
+                        unconditional_embeds = self.encode_prompt(
+                            gen_config.negative_prompt, gen_config.negative_prompt_2, force_all=True
+                        )
+                        if isinstance(self.adapter, CustomAdapter):
+                            self.adapter.is_unconditional_run = False
 
                     # allow any manipulations to take place to embeddings
                     gen_config.post_process_embeddings(
@@ -1053,14 +1056,15 @@ class StableDiffusion:
                             has_been_preprocessed=False,
                             is_generating_samples=True,
                         )
-                        unconditional_embeds = self.adapter.condition_encoded_embeds(
-                            tensors_0_1=validation_image,
-                            prompt_embeds=unconditional_embeds,
-                            is_training=False,
-                            has_been_preprocessed=False,
-                            is_unconditional=True,
-                            is_generating_samples=True,
-                        )
+                        if unconditional_embeds is not None:
+                            unconditional_embeds = self.adapter.condition_encoded_embeds(
+                                tensors_0_1=validation_image,
+                                prompt_embeds=unconditional_embeds,
+                                is_training=False,
+                                has_been_preprocessed=False,
+                                is_unconditional=True,
+                                is_generating_samples=True,
+                            )
 
                     if self.adapter is not None and isinstance(self.adapter, CustomAdapter) and len(
                             gen_config.extra_values) > 0:
@@ -1079,7 +1083,12 @@ class StableDiffusion:
                             raise ValueError("Refiner is only supported for XL models")
 
                     conditional_embeds = conditional_embeds.to(self.device_torch, dtype=self.unet.dtype)
-                    unconditional_embeds = unconditional_embeds.to(self.device_torch, dtype=self.unet.dtype)
+                    if unconditional_embeds is None:
+                        unconditional_embeds_pooled = None
+                    else:
+                        unconditional_embeds = unconditional_embeds.to(self.device_torch, dtype=self.unet.dtype)
+                        unconditional_embeds_pooled = unconditional_embeds.pooled_embeds
+                        unconditional_embeds = unconditional_embeds.text_embeds
 
                     if self.is_xl:
                         # fix guidance rescale for sdxl
@@ -1132,8 +1141,8 @@ class StableDiffusion:
                             img = pipeline(
                                 prompt_embeds=conditional_embeds.text_embeds,
                                 pooled_prompt_embeds=conditional_embeds.pooled_embeds,
-                                negative_prompt_embeds=unconditional_embeds.text_embeds,
-                                negative_pooled_prompt_embeds=unconditional_embeds.pooled_embeds,
+                                negative_prompt_embeds=unconditional_embeds,
+                                negative_pooled_prompt_embeds=unconditional_embeds_pooled,
                                 height=gen_config.height,
                                 width=gen_config.width,
                                 num_inference_steps=gen_config.num_inference_steps,
