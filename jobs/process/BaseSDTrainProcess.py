@@ -183,11 +183,23 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.snr_gos: Union[LearnableSNRGamma, None] = None
         self.ema: ExponentialMovingAverage = None
 
+    def memory_snapshot(self, name, step=None):
+        if step is None:
+            filename = f'memtrace_{name}_{self.job.name}.pickle'
+        else:
+            filename = f'memtrace_{name}_{self.job.name}_{str(step).zfill(9)}.pickle'
+        torch.cuda.memory._dump_snapshot(filename=os.path.join(self.save_root, filename))
+        # Clear the traces
+        torch.cuda.memory._record_memory_history(max_entries=0, enabled=None)
+        torch.cuda.memory._record_memory_history(max_entries=100000000, enabled='all')
+
+
     def post_process_generate_image_config_list(self, generate_image_config_list: List[GenerateImageConfig]):
         # override in subclass
         return generate_image_config_list
 
     def sample(self, step=None, is_first=False):
+        self.memory_snapshot('pre_sample', step=step)
         flush()
         sample_folder = os.path.join(self.save_root, 'samples')
         gen_img_config_list = []
@@ -270,6 +282,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         if self.ema is not None:
             self.ema.train()
+
+        self.memory_snapshot('post_sample', step=step)
 
     def update_training_metadata(self):
         o_dict = OrderedDict({
@@ -383,6 +397,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         pass
 
     def save(self, step=None):
+        self.memory_snapshot('pre_save', step=step)
         flush()
         if self.ema is not None:
             # always save params as ema
@@ -550,6 +565,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.ema is not None:
             self.ema.train()
         flush()
+
+        self.memory_snapshot('post_save', step=step)
 
     # Called before the model is loaded
     def hook_before_model_load(self):
@@ -1228,6 +1245,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         )
         # run base sd process run
         self.sd.load_model()
+        self.memory_snapshot('post_load')
 
         dtype = get_torch_dtype(self.train_config.dtype)
 
@@ -1623,6 +1641,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         ###################################################################
         # TRAIN LOOP
         ###################################################################
+        self.memory_snapshot('pre_train')
 
         start_step_num = self.step_num
         did_first_flush = False
@@ -1777,6 +1796,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # update various steps
                 self.step_num = step + 1
                 self.grad_accumulation_step += 1
+
+                self.memory_snapshot('post_step', step=step)
 
 
         ###################################################################

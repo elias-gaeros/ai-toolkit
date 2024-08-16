@@ -30,6 +30,8 @@ class BaseTrainProcess(BaseProcess):
         self.job: Union['TrainJob', 'BaseJob', 'ExtensionJob']
         self.progress_bar: 'tqdm' = None
 
+        torch.cuda.memory._record_memory_history(max_entries=100000000, enabled='all')
+
         self.training_seed = self.get_conf('training_seed', self.job.training_seed if hasattr(self.job, 'training_seed') else None)
         # if training seed is set, use it
         if self.training_seed is not None:
