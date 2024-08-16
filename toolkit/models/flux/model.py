@@ -15,6 +15,7 @@ from .layers import (
     timestep_embedding,
 )
 from .utils import ModelMixin
+from torch.utils.checkpoint import checkpoint
 
 
 
@@ -107,7 +108,7 @@ class Flux(nn.Module, ModelMixin):
             raise ValueError("Input img and txt tensors must have 3 dimensions.")
 
         # running on sequences img
-        print(f'{img.dtype=} {txt.dtype=}')
+        # print(f'{img.dtype=} {txt.dtype=}')
         img = self.img_in(img)
         
         vec = self.time_in(timestep_embedding(timesteps, 256).to(img.dtype))
@@ -119,14 +120,17 @@ class Flux(nn.Module, ModelMixin):
         vec = vec + self.vector_in(y)
         txt = self.txt_in(txt)
 
-        print(f'in -> {img.dtype=} {txt.dtype=} {vec.dtype=}')
+        # print(f'in -> {img.dtype=} {txt.dtype=} {vec.dtype=}')
 
         ids = torch.cat((txt_ids, img_ids), dim=1)
         pe = self.pe_embedder(ids)
-        print(f'{txt_ids.dtype=} {img_ids.dtype=} {ids.dtype=} {pe.dtype=}')
+        # print(f'{txt_ids.dtype=} {img_ids.dtype=} {ids.dtype=} {pe.dtype=}')
 
-        for i in range(len(self.double_blocks)):
-            img, txt = self.double_blocks[i](img=img, txt=txt, vec=vec, pe=pe)
+        for i, block in enumerate(self.double_blocks):
+            if self.training:
+                img, txt = checkpoint(block, img, txt, vec, pe, use_reentrant=False)
+            else:
+                img, txt = block(img=img, txt=txt, vec=vec, pe=pe)
 
             if control is not None: #Controlnet
                 control_o = control.get("output")
@@ -135,14 +139,17 @@ class Flux(nn.Module, ModelMixin):
                     if add is not None:
                         img += add
 
-        print(f'double_block -> {img.dtype=} {txt.dtype=}')
+        # print(f'double_block -> {img.dtype=} {txt.dtype=}')
 
         img = torch.cat((txt, img), 1)
         for block in self.single_blocks:
-            img = block(img, vec=vec, pe=pe)
+            if self.training:
+                img = checkpoint(block, img, vec, pe, use_reentrant=False)
+            else:
+                img = block(img, vec=vec, pe=pe)
         img = img[:, txt.shape[1] :, ...]
 
-        print(f'double_block -> {img.dtype=}')
+        # print(f'double_block -> {img.dtype=}')
 
         img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)
         return img
