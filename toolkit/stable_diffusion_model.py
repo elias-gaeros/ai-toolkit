@@ -470,87 +470,18 @@ class StableDiffusion:
             tokenizer = pipe.tokenizer
 
         elif self.model_config.is_flux:
-            print("Loading Flux model")
-            base_model_path = "black-forest-labs/FLUX.1-schnell"
-            print("Loading transformer")
-            subfolder = 'transformer'
-            transformer_path = model_path
-            local_files_only = False
-            # check if HF_DATASETS_OFFLINE or TRANSFORMERS_OFFLINE is set
-            if os.path.exists(transformer_path):
-                subfolder = None
-                transformer_path = os.path.join(transformer_path, 'transformer')
-                # check if the path is a full checkpoint.
-                te_folder_path = os.path.join(model_path, 'text_encoder')
-                # if we have the te, this folder is a full checkpoint, use it as the base
-                if os.path.exists(te_folder_path):
-                    base_model_path = model_path
-
-            transformer = FluxTransformer2DModel.from_pretrained(
-                transformer_path,
-                subfolder=subfolder,
-                torch_dtype=dtype,
-                # low_cpu_mem_usage=False,
-                # device_map=None
-            )
-            if not self.low_vram:
-                # for low v ram, we leave it on the cpu. Quantizes slower, but allows training on primary gpu
-                transformer.to(torch.device(self.quantize_device), dtype=dtype)
+            print('Loading checkpoint')
+            checkpoint = CombinedCheckpoint(model_path)
+            text_encoder, tokenizer = checkpoint.load_clip()
+            text_encoder_2, tokenizer_2 = checkpoint.load_t5()
+            vae = checkpoint.load_vae()
+            transformer = checkpoint.load_transformer()
             flush()
-
-            if self.model_config.lora_path is not None:
-                # need the pipe to do this unfortunately for now
-                # we have to fuse in the weights before quantizing
-                pipe: FluxPipeline = FluxPipeline(
-                    scheduler=None,
-                    text_encoder=None,
-                    tokenizer=None,
-                    text_encoder_2=None,
-                    tokenizer_2=None,
-                    vae=None,
-                    transformer=transformer,
-                )
-                pipe.load_lora_weights(self.model_config.lora_path, adapter_name="lora1")
-                pipe.fuse_lora()
-                # unfortunately, not an easier way with peft
-                pipe.unload_lora_weights()
-
-            if self.model_config.quantize:
-                quantization_type = qfloat8
-                print("Quantizing transformer")
-                quantize(transformer, weights=quantization_type)
-                freeze(transformer)
-                transformer.to(self.device_torch)
-            else:
-                transformer.to(self.device_torch, dtype=dtype)
-
-            flush()
-
-            scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(base_model_path, subfolder="scheduler")
-            print("Loading vae")
-            vae = AutoencoderKL.from_pretrained(base_model_path, subfolder="vae", torch_dtype=dtype)
-            flush()
-
-            print("Loading t5")
-            tokenizer_2 = T5TokenizerFast.from_pretrained(base_model_path, subfolder="tokenizer_2", torch_dtype=dtype)
-            text_encoder_2 = T5EncoderModel.from_pretrained(base_model_path, subfolder="text_encoder_2",
-                                                            torch_dtype=dtype)
-
-            text_encoder_2.to(self.device_torch, dtype=dtype)
-            flush()
-
-            print("Quantizing T5")
-            quantize(text_encoder_2, weights=qfloat8)
-            freeze(text_encoder_2)
-            flush()
-
-            print("Loading clip")
-            text_encoder = CLIPTextModel.from_pretrained(base_model_path, subfolder="text_encoder", torch_dtype=dtype)
-            tokenizer = CLIPTokenizer.from_pretrained(base_model_path, subfolder="tokenizer", torch_dtype=dtype)
-            text_encoder.to(self.device_torch, dtype=dtype)
 
             print("making pipe")
-            pipe: FluxPipeline = FluxPipeline(
+            base_model_path = "black-forest-labs/FLUX.1-dev"
+            scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(base_model_path, subfolder="scheduler")
+            pipe: BflFluxPipeline = BflFluxPipeline(
                 scheduler=scheduler,
                 text_encoder=text_encoder,
                 tokenizer=tokenizer,
@@ -563,13 +494,8 @@ class StableDiffusion:
             pipe.transformer = transformer
 
             print("preparing")
-
             text_encoder = [pipe.text_encoder, pipe.text_encoder_2]
             tokenizer = [pipe.tokenizer, pipe.tokenizer_2]
-
-            pipe.transformer = pipe.transformer.to(self.device_torch)
-
-            flush()
             text_encoder[0].to(self.device_torch)
             text_encoder[0].requires_grad_(False)
             text_encoder[0].eval()
@@ -856,7 +782,7 @@ class StableDiffusion:
                     )
 
                 else:
-                    pipeline = FluxPipeline(
+                    pipeline = BflFluxPipeline(
                         vae=self.vae,
                         transformer=self.unet,
                         text_encoder=self.text_encoder[0],
@@ -2159,7 +2085,7 @@ class StableDiffusion:
 
                 # train the guidance embedding
                 if self.unet.config.guidance_embeds:
-                    transformer: FluxTransformer2DModel = self.unet
+                    transformer: flux.Flux = self.unet
                     for name, param in transformer.time_text_embed.named_parameters(recurse=True,
                                                                                     prefix=f"{SD_PREFIX_UNET}"):
                         named_params[name] = param
@@ -2269,7 +2195,7 @@ class StableDiffusion:
             # else:
             if self.is_flux:
                 # only save the unet
-                transformer: FluxTransformer2DModel = self.unet
+                transformer: flux.Flux = self.unet
                 transformer.save_pretrained(
                     save_directory=os.path.join(output_file, 'transformer'),
                     safe_serialization=True,

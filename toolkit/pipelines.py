@@ -4,9 +4,8 @@ from typing import Union, List, Optional, Dict, Any, Tuple, Callable
 
 import numpy as np
 import torch
-from diffusers import StableDiffusionXLPipeline, StableDiffusionPipeline, LMSDiscreteScheduler, FluxPipeline
-from diffusers.pipelines.flux.pipeline_flux import calculate_shift, retrieve_timesteps
-from diffusers.pipelines.flux.pipeline_output import FluxPipelineOutput
+from diffusers import StableDiffusionXLPipeline, StableDiffusionPipeline, LMSDiscreteScheduler
+from .models.flux.pipe import FluxPipeline, calculate_shift, retrieve_timesteps, FluxPipelineOutput
 from diffusers.pipelines.stable_diffusion import StableDiffusionPipelineOutput
 # from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_k_diffusion import ModelWrapper
 from diffusers.pipelines.stable_diffusion_xl.pipeline_output import StableDiffusionXLPipelineOutput
