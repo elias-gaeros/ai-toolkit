@@ -2024,7 +2024,11 @@ class StableDiffusion:
                 attention_mask=attention_mask,  # not used
             )
         elif self.is_flux:
-            prompt_embeds, pooled_prompt_embeds = train_tools.encode_prompts_flux(
+            if isinstance(self.text_encoder[1], flux.T5):
+                encode_prompts = train_tools.encode_prompts_flux_bfl
+            else:
+                encode_prompts = train_tools.encode_prompts_flux
+            prompt_embeds, pooled_prompt_embeds = encode_prompts(
                 self.tokenizer,  # list
                 self.text_encoder,  # list
                 prompt,
