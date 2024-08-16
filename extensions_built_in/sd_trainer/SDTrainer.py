@@ -58,7 +58,7 @@ class SDTrainer(BaseSDTrainProcess):
         self.negative_prompt_pool: Union[List[str], None] = None
         self.batch_negative_prompt: Union[List[str], None] = None
 
-        self.scaler = torch.cuda.amp.GradScaler()
+        self.scaler = torch.amp.GradScaler()
 
         self.is_bfloat = self.train_config.dtype == "bfloat16" or self.train_config.dtype == "bf16"
 
