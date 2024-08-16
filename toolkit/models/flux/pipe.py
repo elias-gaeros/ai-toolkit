@@ -681,7 +681,7 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
                 timestep = t.expand(latents.shape[0]).to(latents.dtype)
 
                 # handle guidance
-                if self.transformer.config.guidance_embed:
+                if self.transformer.config.guidance_embeds:
                     guidance = torch.tensor([guidance_scale], device=device)
                     guidance = guidance.expand(latents.shape[0])
                 else:

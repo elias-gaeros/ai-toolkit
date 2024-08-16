@@ -50,7 +50,7 @@ class Configs:
             axes_dim=[16, 56, 56],
             theta=10_000,
             qkv_bias=any(k.endswith("qkv.bias") for k in state_dict),
-            guidance_embed="guidance_in.in_layer.weight" in state_dict,
+            guidance_embeds="guidance_in.in_layer.weight" in state_dict,
         )
 
     def get_t5_config(self) -> tuple[T5Config, T5TokenizerFast]:
