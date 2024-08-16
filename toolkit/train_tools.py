@@ -577,6 +577,55 @@ def encode_prompts_flux(
 
     return prompt_embeds, pooled_prompt_embeds
 
+def encode_prompts_flux_bfl(
+        tokenizer: List[Union['CLIPTokenizer','T5Tokenizer']],
+        text_encoder: List[Union['CLIPTextModel', 'T5EncoderModel']],
+        prompts: list[str],
+        truncate: bool = True,
+        max_length=None,
+        dropout_prob=0.0,
+):
+    if max_length is None:
+        max_length = 512
+
+    if dropout_prob > 0.0:
+        # randomly drop out prompts
+        prompts = [
+            prompt if torch.rand(1).item() > dropout_prob else "" for prompt in prompts
+        ]
+
+    # clip
+    device = text_encoder[0].device
+    dtype = text_encoder[0].dtype
+    text_input_ids = tokenizer[0](
+        prompts,
+        padding="max_length",
+        max_length=tokenizer[0].model_max_length,
+        truncation=True,
+        return_overflowing_tokens=False,
+        return_length=False,
+        return_tensors="pt",
+    ).input_ids
+    prompt_embeds = text_encoder[0](text_input_ids.to(device), dtype=dtype)
+    # Use pooled output of CLIPTextModel
+    pooled_prompt_embeds = prompt_embeds[-1]
+
+    # T5
+    device = text_encoder[0].device
+    dtype = text_encoder[1].dtype
+    text_input_ids = tokenizer[1](
+        prompts,
+        padding="max_length",
+        max_length=max_length,
+        truncation=True,
+        return_length=False,
+        return_overflowing_tokens=False,
+        return_tensors="pt",
+    ).input_ids
+    
+    prompt_embeds = text_encoder[1](text_input_ids.to(device), dtype=dtype)[0]
+
+    return prompt_embeds, pooled_prompt_embeds
 
 # for XL
 def get_add_time_ids(
