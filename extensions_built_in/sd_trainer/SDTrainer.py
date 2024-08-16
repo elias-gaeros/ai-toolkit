@@ -58,7 +58,7 @@ class SDTrainer(BaseSDTrainProcess):
         self.negative_prompt_pool: Union[List[str], None] = None
         self.batch_negative_prompt: Union[List[str], None] = None
 
-        self.scaler = torch.cuda.amp.GradScaler()
+        self.scaler = torch.amp.GradScaler()
 
         # patch the scaler to allow fp16 training
         org_unscale_grads = self.scaler._unscale_grads_
