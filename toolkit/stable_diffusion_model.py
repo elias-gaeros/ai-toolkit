@@ -37,6 +37,9 @@ from toolkit.sampler import get_sampler
 from toolkit.saving import save_ldm_model_from_diffusers, get_ldm_state_dict_from_diffusers
 from toolkit.sd_device_states_presets import empty_preset
 from toolkit.train_tools import get_torch_dtype, apply_noise_offset
+from toolkit.models.flux.loader import CombinedCheckpoint
+from toolkit.models.flux.pipe import FluxPipeline as BflFluxPipeline
+from toolkit.models import flux
 from einops import rearrange, repeat
 import torch
 from toolkit.pipelines import CustomStableDiffusionXLPipeline, CustomStableDiffusionPipeline, \
@@ -86,6 +89,8 @@ DO_NOT_TRAIN_WEIGHTS = [
     "refiner_unet_time_embedding.linear_2.bias",
     "refiner_unet_time_embedding.linear_2.weight",
 ]
+
+T5_MODELS = [T5EncoderModel, UMT5EncoderModel, flux.T5]
 
 DeviceStatePreset = Literal['cache_latents', 'generate']
 
@@ -1963,7 +1968,7 @@ class StableDiffusion:
         # move to device and dtype
         image_list = [image.to(device, dtype=dtype) for image in image_list]
 
-        VAE_SCALE_FACTOR = 2 ** (len(self.vae.config['block_out_channels']) - 1)
+        VAE_SCALE_FACTOR = self.vae_scale_factor
 
         # resize images if not divisible by 8
         for i in range(len(image_list)):
@@ -1973,15 +1978,16 @@ class StableDiffusion:
                                         image.shape[2] // VAE_SCALE_FACTOR * VAE_SCALE_FACTOR))(image)
 
         images = torch.stack(image_list)
+        shift = getattr(self.vae.config, 'shift_factor', 0)
         if isinstance(self.vae, AutoencoderTiny):
             latents = self.vae.encode(images, return_dict=False)[0]
+        elif isinstance(self.vae, flux.AutoEncoder):
+            latents = self.vae.encode(images)
+            shift = None # Already shifted
         else:
             latents = self.vae.encode(images).latent_dist.sample()
-        shift = self.vae.config['shift_factor'] if self.vae.config['shift_factor'] is not None else 0
-
-        # flux ref https://github.com/black-forest-labs/flux/blob/c23ae247225daba30fbd56058d247cc1b1fc20a3/src/flux/modules/autoencoder.py#L303
-        # z = self.scale_factor * (z - self.shift_factor)
-        latents = self.vae.config['scaling_factor'] * (latents - shift)
+        if shift:
+            latents = self.vae.config['scaling_factor'] * (latents - shift)
         latents = latents.to(device, dtype=dtype)
 
         return latents
@@ -2001,8 +2007,12 @@ class StableDiffusion:
         if self.vae.device == 'cpu':
             self.vae.to(self.device)
         latents = latents.to(device, dtype=dtype)
-        latents = (latents / self.vae.config['scaling_factor']) + self.vae.config['shift_factor']
-        images = self.vae.decode(latents).sample
+
+        if isinstance(self.vae, flux.AutoEncoder):
+            latents = self.vae.encode(images)
+        else:
+            latents = (latents / self.vae.config['scaling_factor']) + self.vae.config['shift_factor']
+            images = self.vae.decode(latents).sample
         images = images.to(device, dtype=dtype)
 
         return images
@@ -2339,7 +2349,10 @@ class StableDiffusion:
         # saves the current device state for all modules
         # this is useful for when we want to alter the state and restore it
         if self.is_pixart or self.is_v3 or self.is_auraflow or self.is_flux:
-            unet_has_grad = self.unet.proj_out.weight.requires_grad
+            if isinstance(self.unet, flux.Flux):
+                unet_has_grad = self.unet.final_layer.linear.weight.requires_grad
+            else:
+                unet_has_grad = self.unet.proj_out.weight.requires_grad
         else:
             unet_has_grad = self.unet.conv_in.weight.requires_grad
 
@@ -2356,7 +2369,7 @@ class StableDiffusion:
             },
         }
         if isinstance(self.text_encoder, list):
-            self.device_state['text_encoder']: List[dict] = []
+            self.device_state['text_encoder']: list[dict] = []
             for encoder in self.text_encoder:
                 try:
                     te_has_grad = encoder.text_model.final_layer_norm.weight.requires_grad
@@ -2369,7 +2382,7 @@ class StableDiffusion:
                     'requires_grad': te_has_grad
                 })
         else:
-            if isinstance(self.text_encoder, T5EncoderModel) or isinstance(self.text_encoder, UMT5EncoderModel):
+            if isinstance(self.text_encoder, T5_MODELS):
                 te_has_grad = self.text_encoder.encoder.block[0].layer[0].SelfAttention.q.weight.requires_grad
             else:
                 te_has_grad = self.text_encoder.text_model.final_layer_norm.weight.requires_grad
