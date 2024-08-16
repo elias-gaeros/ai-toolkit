@@ -30,6 +30,7 @@ LINEAR_MODULES = [
     'Linear',
     'LoRACompatibleLinear',
     'QLinear',
+    'LinearNF4',
     # 'GroupNorm',
 ]
 CONV_MODULES = [
@@ -323,9 +324,11 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
                         if self.transformer_only and self.is_pixart and is_unet:
                             if "transformer_blocks" not in lora_name:
                                 skip = True
-                        if self.transformer_only and self.is_flux and is_unet:
-                            if "transformer_blocks" not in lora_name:
-                                skip = True
+                        if self.transformer_only and self.is_flux and is_unet and \
+                            not any([ss in lora_name for ss in ('transformer_blocks', 'single_blocks', 'double_blocks')]):
+                            skip = True
+
+                        print(f'{lora_name=} {is_linear=} {is_conv2d=} {skip=}')
 
                         if (is_linear or is_conv2d) and not skip:
 
@@ -427,7 +430,7 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
             target_modules = ["AuraFlowTransformer2DModel"]
 
         if is_flux:
-            target_modules = ["FluxTransformer2DModel"]
+            target_modules = ["FluxTransformer2DModel", "Flux"]
 
         if train_unet:
             self.unet_loras, skipped_un = create_modules(True, None, unet, target_modules)
