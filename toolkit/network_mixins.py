@@ -197,13 +197,13 @@ class ToolkitModuleMixin:
         else:
             scale = self.scale
 
-        lx = self.lora_up(lx)
-
         # handle trainable scaler method locon does
-        if hasattr(self, 'scalar'):
+        if hasattr(self, "scalar"):
             scale = scale * self.scalar
 
-        return lx * scale
+        lx = lx.mul_(scale)
+
+        return self.lora_up(lx)
 
     def lorm_forward(self: Network, x, *args, **kwargs):
         network: Network = self.network_ref()
@@ -265,17 +265,18 @@ class ToolkitModuleMixin:
         # always cast to float32
         lora_input = x.to(self.lora_down.weight.dtype)
         lora_output = self._call_forward(lora_input)
+        del lora_input
         multiplier = self.network_ref().torch_multiplier
+        if multiplier is not None:
+            lora_output_batch_size = lora_output.size(0)
+            multiplier_batch_size = multiplier.size(0)
+            if lora_output_batch_size != multiplier_batch_size:
+                num_interleaves = lora_output_batch_size // multiplier_batch_size
+                # todo check if this is correct, do we just concat when doing cfg?
+                multiplier = multiplier.repeat_interleave(num_interleaves)
 
-        lora_output_batch_size = lora_output.size(0)
-        multiplier_batch_size = multiplier.size(0)
-        if lora_output_batch_size != multiplier_batch_size:
-            num_interleaves = lora_output_batch_size // multiplier_batch_size
-            # todo check if this is correct, do we just concat when doing cfg?
-            multiplier = multiplier.repeat_interleave(num_interleaves)
-
-        scaled_lora_output = broadcast_and_multiply(lora_output, multiplier)
-        scaled_lora_output = scaled_lora_output.to(org_forwarded.dtype)
+            lora_output = broadcast_and_multiply(lora_output, multiplier)
+        lora_output = lora_output.to(org_forwarded.dtype)
 
         if self.__class__.__name__ == "DoRAModule":
             # ref https://github.com/huggingface/peft/blob/1e6d1d73a0850223b0916052fd8d2382a90eae5a/src/peft/tuners/lora/layer.py#L417
@@ -293,14 +294,14 @@ class ToolkitModuleMixin:
             # todo handle our batch split scalers for slider training. For now take the mean of them
             scale = multiplier.mean()
             scaled_lora_weight = lora_weight * scale
-            scaled_lora_output = scaled_lora_output + self.apply_dora(lx, scaled_lora_weight).to(org_forwarded.dtype)
+            lora_output = lora_output + self.apply_dora(lx, scaled_lora_weight).to(org_forwarded.dtype)
 
         try:
-            x = org_forwarded + scaled_lora_output
+            x = org_forwarded.add_(lora_output)
         except RuntimeError as e:
             print(e)
             print(org_forwarded.size())
-            print(scaled_lora_output.size())
+            print(lora_output.size())
             raise e
         return x
 
@@ -607,13 +608,26 @@ class ToolkitNetworkMixin:
         with torch.no_grad():
             tensor_multiplier = None
             if isinstance(multiplier, int) or isinstance(multiplier, float):
-                tensor_multiplier = torch.tensor((multiplier,)).to(device, dtype=dtype)
+                if abs(multiplier - 1) < 1e-6:
+                    self.torch_multiplier = None
+                else:
+                    self.tensor_multiplier = torch.tensor((multiplier,)).to(
+                        device, dtype=dtype
+                    )
             elif isinstance(multiplier, list):
-                tensor_multiplier = torch.tensor(multiplier).to(device, dtype=dtype)
+                if all(abs(m - 1) < 1e-6 for m in multiplier):
+                    self.torch_multiplier = None
+                else:
+                    self.tensor_multiplier = torch.tensor(multiplier).to(
+                        device, dtype=dtype
+                    )
             elif isinstance(multiplier, torch.Tensor):
-                tensor_multiplier = multiplier.clone().detach().to(device, dtype=dtype)
-
-            self.torch_multiplier = tensor_multiplier.clone().detach()
+                if torch.allclose(multiplier, torch.ones_like(multiplier)):
+                    self.tensor_multiplier = None
+                else:
+                    self.tensor_multiplier = (
+                        multiplier.clone().detach().to(device, dtype=dtype)
+                    )
 
     @property
     def multiplier(self) -> Union[float, List[float], List[List[float]]]:
